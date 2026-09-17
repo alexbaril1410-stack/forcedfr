@@ -2480,14 +2480,12 @@ def get_analysis_history(limit: int | None = None) -> list[dict[str, Any]]:
             ORDER BY analyzed_at DESC
             LIMIT ?
         """, (history_limit,)).fetchall()
-    results = [dict(row) for row in rows]
-    # Pour les anciennes entrées sans URLs, on enrichit progressivement
-    # les plus récentes afin de ne pas ralentir l'ouverture de l'historique.
-    for index, item in enumerate(results):
-        if index >= 50:
-            break
-        _resolve_missing_history_context(item)
-    return results
+    # IMPORTANT : ne jamais interroger Radarr/Sonarr ici.
+    # L'historique doit s'ouvrir immédiatement depuis SQLite.
+    # Les URLs sont récupérées et enregistrées au moment de l'analyse ;
+    # les anciennes entrées sans URL restent donc affichées sans bloquer
+    # l'ouverture de la page.
+    return [dict(row) for row in rows]
 
 
 scan_lock = threading.Lock()
