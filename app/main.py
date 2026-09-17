@@ -94,7 +94,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.5.5",
+    version="2.5.6",
 )
 
 
@@ -711,6 +711,33 @@ def build_disabled_decision_view(message: Any) -> Any:
     return view
 
 
+class ForcedFRTestView(discord.ui.View if discord else object):
+    def __init__(self) -> None:
+        if discord is None:
+            return
+        super().__init__(timeout=300)
+        self.add_item(discord.ui.Button(label="🔗 Test lien", style=discord.ButtonStyle.link, url=build_qbittorrent_url("test")))
+        self.add_item(discord.ui.Button(label="▶ Tester Continuer", style=discord.ButtonStyle.success, custom_id="forcedfr:test:resume"))
+        self.add_item(discord.ui.Button(label="⏸ Tester Pause", style=discord.ButtonStyle.secondary, custom_id="forcedfr:test:pause"))
+
+
+async def send_discord_test_message() -> None:
+    if discord_bot is None or not discord_bot.is_ready():
+        raise RuntimeError("Bot Discord non prêt. Vérifie le token, l'ID du salon et redémarre ForcedFR si nécessaire.")
+    if not DISCORD_CHANNEL_ID:
+        raise RuntimeError("ID du salon Discord non configuré.")
+    channel = discord_bot.get_channel(int(DISCORD_CHANNEL_ID))
+    if channel is None:
+        channel = await discord_bot.fetch_channel(int(DISCORD_CHANNEL_ID))
+    embed = discord.Embed(
+        title="🧪 Test ForcedFR",
+        description="Message de test du bot Discord. Les boutons ci-dessous sont sans effet sur qBittorrent.",
+    )
+    embed.add_field(name="Connexion", value="✅ Bot connecté et salon accessible.", inline=False)
+    embed.add_field(name="Boutons", value="▶ Continuer et ⏸ Pause simulent les actions Discord.", inline=False)
+    await channel.send(embed=embed, view=ForcedFRTestView())
+
+
 def build_discord_bot() -> Any:
     if discord is None:
         return None
@@ -740,6 +767,15 @@ def build_discord_bot() -> Any:
             _, action, torrent_hash = parts
 
             await interaction.response.defer(ephemeral=True)
+
+            if torrent_hash == "test":
+                if action == "resume":
+                    await interaction.followup.send("🧪 Test réussi : le bouton « Continuer » fonctionne. Aucun torrent n’a été modifié.", ephemeral=True)
+                elif action == "pause":
+                    await interaction.followup.send("🧪 Test réussi : le bouton « Pause » fonctionne. Aucun torrent n’a été modifié.", ephemeral=True)
+                else:
+                    await interaction.followup.send("🧪 Action de test inconnue.", ephemeral=True)
+                return
 
             if torrent_hash in resolved_discord_actions:
                 await interaction.followup.send(
@@ -1551,6 +1587,15 @@ def process_new_torrent(
             torrent_hash
         )
 
+        ignored_tag = torrent_has_ignored_tag(torrent)
+        if ignored_tag:
+            log.info(
+                "[%s] Analyse ignorée : étiquette qBittorrent « %s » configurée dans ForcedFR.",
+                torrent_hash,
+                ignored_tag,
+            )
+            return
+
         if not torrent.get(
             "f_l_piece_prio",
             False,
@@ -1926,6 +1971,15 @@ async def monitor_qbittorrent() -> None:
                 )
 
                 for torrent_hash in new_torrents:
+                    torrent = next((t for t in torrents if t.get("hash") == torrent_hash), None)
+                    ignored_tag = torrent_has_ignored_tag(torrent or {})
+                    if ignored_tag:
+                        log.info(
+                            "[%s] Torrent ignoré : étiquette qBittorrent « %s » configurée dans ForcedFR.",
+                            torrent_hash,
+                            ignored_tag,
+                        )
+                        continue
 
                     asyncio.create_task(
                         asyncio.to_thread(
@@ -2034,7 +2088,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.5.5",
+        "version": "2.5.6",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -2327,6 +2381,7 @@ def init_database() -> None:
             "notify_errors": "1",
             "library_profile_films": "strict",
             "library_profile_series": "strict",
+            "qb_ignored_tags": "",
         }
         for key, value in defaults.items():
             conn.execute(
@@ -2372,6 +2427,23 @@ def set_setting(key: str, value: str) -> None:
             "INSERT INTO forcedfr_settings(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
             (key, str(value), time.time()),
         )
+
+
+def get_ignored_qb_tags() -> set[str]:
+    raw = _setting("qb_ignored_tags", "")
+    return {tag.strip().casefold() for tag in raw.replace(";", ",").split(",") if tag.strip()}
+
+
+def torrent_has_ignored_tag(torrent: dict[str, Any]) -> str | None:
+    ignored = get_ignored_qb_tags()
+    if not ignored:
+        return None
+    raw_tags = torrent.get("tags") or ""
+    tags = [t.strip() for t in str(raw_tags).split(",") if t.strip()]
+    for tag in tags:
+        if tag.casefold() in ignored:
+            return tag
+    return None
 
 
 def record_library_error(item: dict[str, Any], file_path: Path | None, error: str) -> None:
@@ -3094,7 +3166,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.5.5</title>
+<title>ForcedFR v2.5.6</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -3106,11 +3178,11 @@ select,input{font:inherit;background:#0d131c;color:var(--text);border:1px solid 
 table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14px;text-align:left;border-bottom:1px solid var(--border);vertical-align:middle}th{color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.06em;font-weight:850;background:#0d141e}tbody tr:hover{background:rgba(255,255,255,.018)}tbody tr:last-child td{border-bottom:0}.tablewrap{padding:0;overflow:auto;margin-top:13px}.badge{font-weight:760}.yes{color:var(--green)}.no{color:var(--red)}.err{color:var(--yellow)}a.btn,.review-btn{display:inline-flex;align-items:center;justify-content:center;background:var(--surface3);color:#dce5ee;text-decoration:none;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:.75rem;font-weight:720;margin:2px 4px 2px 0;white-space:nowrap}.review-btn:hover,a.btn:hover{background:#26364a;border-color:#40536c;color:#fff}.empty{color:var(--muted);text-align:center;padding:28px}
 .section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin:25px 0 13px}.section-head h2{margin:0}.section-head .sub{margin:5px 0 0}.activity{padding:0;overflow:hidden}.activity-row{display:grid;grid-template-columns:105px 1fr auto;gap:15px;align-items:center;padding:14px 17px;border-bottom:1px solid var(--border)}.activity-row:last-child{border-bottom:0}.activity-date{color:var(--muted);font-size:.74rem;white-space:nowrap}.activity-main{min-width:0}.activity-action{font-weight:780;font-size:.81rem}.activity-details{color:#9eabb9;font-size:.76rem;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:8px;box-shadow:0 0 0 3px rgba(53,201,138,.08)}
 .subtabs{margin:18px 0 14px;padding:4px;width:max-content;background:var(--surface);border:1px solid var(--border);border-radius:11px}.subtab{padding:8px 12px}
-.media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px}.media-card{background:rgba(16,23,34,.92);border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:var(--shadow);transition:.16s}.media-card:hover{border-color:#3a4d67;transform:translateY(-1px)}.poster{width:100%;aspect-ratio:2/3;object-fit:cover;background:#0c121a;display:block}.poster-placeholder{width:100%;aspect-ratio:2/3;display:grid;place-items:center;background:linear-gradient(145deg,#172233,#0c121a);color:#718095;font-size:2rem}.media-info{padding:12px}.media-title{font-weight:850;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-meta{color:var(--muted);font-size:.74rem;margin-top:5px}.media-actions{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}.media-actions a.btn{margin:0}.series-card{cursor:pointer}.series-summary{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.mini-pill{padding:4px 7px;border-radius:999px;background:#1c2735;font-size:.68rem;font-weight:800;color:#aeb9c6}.mini-pill.y{color:var(--green)}.mini-pill.n{color:var(--red)}.mini-pill.w{color:var(--yellow)}.series-detail{display:none}.series-detail.active{display:block}.series-detail-head{display:grid;grid-template-columns:180px 1fr;gap:24px;align-items:start;margin:20px 0}.series-detail-poster{width:180px;aspect-ratio:2/3;object-fit:cover;border-radius:14px;border:1px solid var(--border);box-shadow:var(--shadow)}.series-detail-title{font-size:1.6rem;font-weight:900}.series-detail-meta{color:var(--muted);margin-top:7px}.series-detail-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.episode-list{display:grid;gap:8px}.episode-card{display:grid;grid-template-columns:90px 1fr auto;gap:15px;align-items:center;padding:14px 16px;background:var(--surface);border:1px solid var(--border);border-radius:12px}.episode-number{font-weight:850}.episode-title{font-weight:750}.episode-status{font-size:.78rem;margin-top:4px}.episode-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.episode-ok{color:var(--green);font-weight:800}.episode-no{color:var(--red);font-weight:800}.episode-err{color:var(--yellow);font-weight:800}.config-group{padding:13px 0;border-top:1px solid var(--border)}.config-group:first-of-type{border-top:0}.config-group h4{margin:0 0 10px;font-size:.82rem}.config-field{display:grid;grid-template-columns:125px 1fr;align-items:center;gap:12px;margin:8px 0}.config-field>span{color:var(--muted);font-size:.76rem}.config-field input{width:100%;min-width:0}.config-note{margin-top:12px;line-height:1.5}
+.media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px}.media-card{background:rgba(16,23,34,.92);border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:var(--shadow);transition:.16s}.media-card:hover{border-color:#3a4d67;transform:translateY(-1px)}.poster{width:100%;aspect-ratio:2/3;object-fit:cover;background:#0c121a;display:block}.poster-placeholder{width:100%;aspect-ratio:2/3;display:grid;place-items:center;background:linear-gradient(145deg,#172233,#0c121a);color:#718095;font-size:2rem}.media-info{padding:12px}.media-title{font-weight:850;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-meta{color:var(--muted);font-size:.74rem;margin-top:5px}.media-actions{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}.media-actions a.btn{margin:0}.series-card{cursor:pointer}.series-summary{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.mini-pill{padding:4px 7px;border-radius:999px;background:#1c2735;font-size:.68rem;font-weight:800;color:#aeb9c6}.mini-pill.y{color:var(--green)}.mini-pill.n{color:var(--red)}.mini-pill.w{color:var(--yellow)}.series-detail{display:none}.series-detail.active{display:block}.series-detail-head{display:grid;grid-template-columns:180px 1fr;gap:24px;align-items:start;margin:20px 0}.series-detail-poster{width:180px;aspect-ratio:2/3;object-fit:cover;border-radius:14px;border:1px solid var(--border);box-shadow:var(--shadow)}.series-detail-title{font-size:1.6rem;font-weight:900}.series-detail-meta{color:var(--muted);margin-top:7px}.series-detail-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.episode-list{display:grid;gap:8px}.episode-card{display:grid;grid-template-columns:90px 1fr auto;gap:15px;align-items:center;padding:14px 16px;background:var(--surface);border:1px solid var(--border);border-radius:12px}.episode-number{font-weight:850}.episode-title{font-weight:750}.episode-status{font-size:.78rem;margin-top:4px}.episode-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.episode-ok{color:var(--green);font-weight:800}.episode-no{color:var(--red);font-weight:800}.episode-err{color:var(--yellow);font-weight:800}.config-group{padding:13px 0;border-top:1px solid var(--border)}.config-group:first-of-type{border-top:0}.config-group h4{margin:0 0 10px;font-size:.82rem}.config-field{display:grid;grid-template-columns:125px 1fr;align-items:center;gap:12px;margin:8px 0}.config-field>span{color:var(--muted);font-size:.76rem}.config-field input{width:100%;min-width:0}.config-note{margin-top:12px;line-height:1.5}.test-btn{margin-top:8px;background:var(--surface3);border-color:var(--border)}.test-result{font-size:.76rem;margin-top:7px;min-height:1em}.test-result.ok{color:var(--green)}.test-result.bad{color:var(--red)}
 .settings-grid{display:grid;grid-template-columns:minmax(290px,.8fr) minmax(0,1.5fr);gap:18px;align-items:start}.settings-card{padding:19px}.settings-card h3{margin:0 0 6px}.settings-card .desc{color:var(--muted);font-size:.84rem;line-height:1.5;margin:0 0 16px}.setting-item{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:14px 0;border-top:1px solid var(--border)}.setting-item:first-of-type{border-top:0}.setting-copy strong{display:block;font-size:.85rem}.setting-copy span{display:block;color:var(--muted);font-size:.76rem;margin-top:4px}.switch{position:relative;width:44px;height:24px;flex:0 0 auto}.switch input{display:none}.switch span{position:absolute;inset:0;background:#2b3542;border-radius:999px;cursor:pointer;transition:.2s}.switch span:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.switch input:checked+span{background:var(--green)}.switch input:checked+span:before{transform:translateX(20px)}.savebar{display:flex;justify-content:flex-end;margin-top:17px}.profile-list{display:grid;gap:12px}.profile-card{background:rgba(21,29,39,.76);border:1px solid var(--border);border-radius:13px;padding:17px}.profile-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.profile-name{font-size:.98rem;font-weight:850}.profile-type{color:var(--muted);font-size:.76rem;margin-top:3px}.profile-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.profile-field{display:flex;flex-direction:column;gap:7px}.profile-field label{color:var(--muted);font-size:.68rem;text-transform:uppercase;font-weight:800;letter-spacing:.05em}.profile-field select{width:100%;min-width:0}.profile-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:15px;padding-top:14px;border-top:1px solid var(--border)}.status-pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;background:#202a36;font-size:.72rem;font-weight:800}.status-pill.on{color:var(--green)}.status-pill.off{color:var(--muted)}.settings-title{margin-top:0;margin-bottom:12px}.settings-title h2{margin-bottom:4px}.settings-title p{margin:0}
 @media(max-width:1000px){.services{grid-template-columns:repeat(3,1fr)}.settings-grid{grid-template-columns:1fr}.profile-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:720px){main{padding:22px 15px 40px}.services{grid-template-columns:1fr 1fr}.app-header{align-items:flex-start}.tabs{overflow:auto;flex-wrap:nowrap}.tab{white-space:nowrap}.activity-row{grid-template-columns:1fr;gap:5px}.profile-grid{grid-template-columns:1fr 1fr}.profile-footer{align-items:flex-start;flex-direction:column}.savebar{justify-content:stretch}.savebar button{width:100%}.media-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){.services{grid-template-columns:1fr}.profile-grid{grid-template-columns:1fr}.version{display:none}.media-grid{grid-template-columns:1fr 1fr}}
 </style></head><body><main>
-<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.5.5</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.5.6</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="services">
 <div class="service-card"><div class="service-icon">✓</div><div><div class="service-name">ForcedFR</div><div class="service-meta"><span class="status-dot online"></span> Service actif</div></div></div>
 <div class="service-card"><div class="service-icon"><img src="https://cdn.simpleicons.org/qbittorrent" alt="qBittorrent"></div><div><div class="service-name">qBittorrent</div><div class="service-meta value" id="qb">…</div></div></div>
@@ -3135,15 +3207,16 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 <section id="p-errors" class="panel"><h2>Erreurs à traiter</h2><p class="sub">Erreurs persistantes du scan de bibliothèque. Une réussite lors d'un prochain scan les clôture automatiquement.</p><div class="toolbar"><button onclick="startScan('films','incremental')">↻ Relancer Films</button><button onclick="startScan('series','incremental')">↻ Relancer Séries</button><button onclick="startScan('all','incremental')">↻ Relancer toute la bibliothèque</button></div><div class="tablewrap" style="margin-top:14px"><table><thead><tr><th>Dernière détection</th><th>Média</th><th>Erreur</th><th>Action</th></tr></thead><tbody id="errors"></tbody></table></div></section>
 
 <section id="p-settings" class="panel">
-<div class="section-head"><div><h2>Paramètres</h2><p class="sub">Toutes les connexions de ForcedFR sont configurables ici. Les secrets sont masqués.</p></div></div>
+<div class="section-head"><div><h2>Paramètres</h2><p class="sub">Toutes les connexions de ForcedFR sont configurables ici. Les paramètres sont conservés dans SQLite et survivent aux redémarrages. Les secrets sont masqués.</p></div></div>
 <div class="settings-grid">
 <div class="settings-card"><h3>🔌 Connexions</h3><p class="desc">Configure qBittorrent, Radarr, Sonarr et Discord sans modifier Docker.</p>
-<div class="config-group"><h4>qBittorrent</h4><label class="config-field"><span>Adresse</span><input id="cfgQBHost"></label><label class="config-field"><span>Utilisateur</span><input id="cfgQBUsername"></label><label class="config-field"><span>Mot de passe</span><input id="cfgQBPassword" type="password" placeholder="Laisser vide pour conserver"></label></div>
-<div class="config-group"><h4>Radarr</h4><label class="config-field"><span>Adresse</span><input id="cfgRadarrUrl"></label><label class="config-field"><span>Clé API</span><input id="cfgRadarrKey" type="password" placeholder="Laisser vide pour conserver"></label></div>
-<div class="config-group"><h4>Sonarr</h4><label class="config-field"><span>Adresse</span><input id="cfgSonarrUrl"></label><label class="config-field"><span>Clé API</span><input id="cfgSonarrKey" type="password" placeholder="Laisser vide pour conserver"></label></div>
-<div class="config-group"><h4>Discord</h4><label class="config-field"><span>Token du bot</span><input id="cfgDiscordToken" type="password" placeholder="Laisser vide pour conserver"></label><label class="config-field"><span>ID du salon</span><input id="cfgDiscordChannel"></label><label class="config-field"><span>Webhook URL</span><input id="cfgDiscordWebhook" type="password" placeholder="Laisser vide pour conserver"></label></div>
+<div class="config-group"><h4>qBittorrent</h4><label class="config-field"><span>Adresse</span><input id="cfgQBHost"></label><label class="config-field"><span>Utilisateur</span><input id="cfgQBUsername"></label><label class="config-field"><span>Mot de passe</span><input id="cfgQBPassword" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('qbittorrent')">Tester la connexion</button><div id="test-qbittorrent" class="test-result"></div></div>
+<div class="config-group"><h4>Radarr</h4><label class="config-field"><span>Adresse</span><input id="cfgRadarrUrl"></label><label class="config-field"><span>Clé API</span><input id="cfgRadarrKey" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('radarr')">Tester la connexion</button><div id="test-radarr" class="test-result"></div></div>
+<div class="config-group"><h4>Sonarr</h4><label class="config-field"><span>Adresse</span><input id="cfgSonarrUrl"></label><label class="config-field"><span>Clé API</span><input id="cfgSonarrKey" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('sonarr')">Tester la connexion</button><div id="test-sonarr" class="test-result"></div></div>
+<div class="config-group"><h4>Discord</h4><label class="config-field"><span>Token du bot</span><input id="cfgDiscordToken" type="password" placeholder="Laisser vide pour conserver"></label><label class="config-field"><span>ID du salon</span><input id="cfgDiscordChannel"></label><label class="config-field"><span>Webhook URL</span><input id="cfgDiscordWebhook" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('discord')">Tester le bot Discord</button><div id="test-discord" class="test-result"></div></div>
 <div class="config-group"><h4>Environnement</h4><label class="config-field"><span>Fuseau horaire</span><input id="cfgTZ" placeholder="Europe/Paris"></label></div>
-<div class="savebar"><button class="primary" onclick="saveConnectionSettings()">💾 Enregistrer les connexions</button></div><div class="small config-note">Les connexions qBittorrent / Radarr / Sonarr sont actualisées immédiatement. Un redémarrage est nécessaire après changement du token du bot Discord.</div>
+<div class="config-group"><h4>Étiquettes qBittorrent ignorées</h4><p class="small">Les torrents portant l’une de ces étiquettes ne seront pas analysés par ForcedFR. Sépare les étiquettes par des virgules.</p><label class="config-field"><span>Étiquettes</span><input id="cfgQBIgnoredTags" placeholder="cross-seed, autre-etiquette"></label><div class="config-note">Exemple : <strong>cross-seed</strong>. Si qBittorrent ajoute cette étiquette au torrent, ForcedFR l’ignore automatiquement. Tu peux en saisir plusieurs, séparées par des virgules.</div></div>
+<div class="savebar"><button class="primary" onclick="saveConnectionSettings()">💾 Enregistrer les connexions</button></div><div class="small config-note">Les paramètres sont enregistrés dans SQLite. Les connexions qBittorrent / Radarr / Sonarr sont actualisées immédiatement. Un redémarrage est nécessaire après changement du token du bot Discord. Pour tester une connexion, enregistre d’abord les paramètres.</div>
 </div>
 <div><div class="settings-card"><h3>🔔 Notifications</h3><p class="desc">Choisis les événements qui doivent générer une notification.</p><div class="setting-item"><div class="setting-copy"><strong>Forced FR absent</strong><span>Notifier lorsqu'un torrent est mis en pause.</span></div><label class="switch"><input type="checkbox" id="setNoForced"><span></span></label></div><div class="setting-item"><div class="setting-copy"><strong>Erreur d'analyse</strong><span>Notifier lorsqu'une analyse FFprobe échoue.</span></div><label class="switch"><input type="checkbox" id="setErrors"><span></span></label></div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les notifications</button></div></div><div class="settings-title" style="margin-top:22px"><h2>Profils d'analyse</h2><p class="sub">Règles séparées pour les Films et les Séries.</p></div><div id="profiles" class="profile-list"></div></div>
 </div></section>
@@ -3182,10 +3255,11 @@ function renderHistory(){const q=($('historySearch')?.value||'').toLowerCase(),f
 async function loadDashboard(){const d=await api('/dashboard/stats');const l=d.library,t=d.torrents;const cards=[['Bibliothèque',l.total,'médias'],['Avec Forced FR',l.forced,'validés'],['Sans Forced FR',l.no_forced,'médias'],['🔴 À traiter',l.pending,'médias'],['🟠 En attente',l.waiting,'médias'],['🟢 Absence normale',l.validated,'médias'],['⚠ Erreurs',l.errors,'à traiter'],['Torrents analysés',t.total,'analyses']];$('dashCards').innerHTML=cards.map(c=>'<div class="card"><div class="label">'+c[0]+'</div><div class="value" style="font-size:1.5rem">'+c[1]+'</div><div class="small">'+c[2]+'</div></div>').join('');$('recent').innerHTML=d.recent.length?d.recent.map(i=>{const name=i.torrent_name||'Torrent';const texts={analysis:i.result==='forced_found'?'Analyse terminée : Forced FR détecté':i.result==='no_forced'?'Analyse terminée : aucun Forced FR':'Analyse terminée',auto_pause:'Téléchargement mis en pause automatiquement',pause:'Téléchargement maintenu en pause',resume:'Téléchargement repris'};const label=texts[i.action]||'Action effectuée';return '<div class="activity-row"><div class="activity-date">'+new Date(i.created_at*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</div><div class="activity-main"><div class="activity-action"><span class="activity-dot"></span>'+esc(label)+'</div><div class="activity-details">'+esc(name)+(i.details?' — '+esc(i.details):'')+'</div></div><div>'+ (i.result==='forced_found'?'<span class="badge yes">OK</span>':i.result==='no_forced'?'<span class="badge no">À traiter</span>':'<span class="badge err">Info</span>') +'</div></div>'}).join(''):'<div class="activity-empty">Aucune activité enregistrée pour le moment.</div>'}
 async function loadErrors(){const d=await api('/errors');$('errors').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.last_seen*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td><strong>'+esc(i.title||'—')+'</strong><div class="small">'+esc(i.media_type)+' · '+esc(i.path||'')+'</div></td><td>'+esc(i.error)+'</td><td><button class="review-btn" onclick="resolveError('+i.id+')">✓ Marquer traité</button></td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune erreur à traiter.</td></tr>'}
 async function resolveError(id){try{await api('/errors/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadErrors();loadDashboard()}catch(e){alert(e.message)}}
-async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value='';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value='';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value='';$('cfgDiscordToken').value='';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value='';$('cfgTZ').value=c.values.TZ||'';$('profiles').innerHTML=p.results.map(i=>'<div class="profile-card"><div class="profile-top"><div><div class="profile-name">'+esc(i.media_type==='Film'?'Films':'Séries')+'</div><div class="profile-type">Règles de contrôle de la bibliothèque</div></div><span class="status-pill '+(i.enabled?'on':'off')+'">'+(i.enabled?'● Actif':'○ Inactif')+'</span></div><div class="profile-grid"><div class="profile-field"><label>Forced FR</label><div class="small">'+(i.forced_required?'Obligatoire':'Non obligatoire')+'</div></div><div class="profile-field"><label>Si absent</label><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div><div class="profile-field"><label>Si erreur</label><div class="small">Continuer + notifier</div></div></div><div class="profile-footer"><label class="setting-item" style="padding:0;border:0;justify-content:flex-start"><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+' style="min-width:0;flex:none"><span>Profil actif</span></label><button class="primary" onclick="saveProfile('+JSON.stringify(i.name)+','+JSON.stringify(i.media_type)+','+(i.forced_required?'true':'false')+')">💾 Enregistrer</button></div></div>').join('')}
+async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value='';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value='';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value='';$('cfgDiscordToken').value='';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value='';$('cfgTZ').value=c.values.TZ||'';$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';$('profiles').innerHTML=p.results.map(i=>'<div class="profile-card"><div class="profile-top"><div><div class="profile-name">'+esc(i.media_type==='Film'?'Films':'Séries')+'</div><div class="profile-type">Règles de contrôle de la bibliothèque</div></div><span class="status-pill '+(i.enabled?'on':'off')+'">'+(i.enabled?'● Actif':'○ Inactif')+'</span></div><div class="profile-grid"><div class="profile-field"><label>Forced FR</label><div class="small">'+(i.forced_required?'Obligatoire':'Non obligatoire')+'</div></div><div class="profile-field"><label>Si absent</label><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div><div class="profile-field"><label>Si erreur</label><div class="small">Continuer + notifier</div></div></div><div class="profile-footer"><label class="setting-item" style="padding:0;border:0;justify-content:flex-start"><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+' style="min-width:0;flex:none"><span>Profil actif</span></label><button class="primary" onclick="saveProfile('+JSON.stringify(i.name)+','+JSON.stringify(i.media_type)+','+(i.forced_required?'true':'false')+')">💾 Enregistrer</button></div></div>').join('')}
 async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,error_action:'notify_continue',enabled:$('ena-'+name).checked})});alert('Profil enregistré. Les nouveaux médias analysés utiliseront ce réglage.')}catch(e){alert(e.message)}}
-async function saveConnectionSettings(){try{const payload={QB_HOST:$('cfgQBHost').value,QB_USERNAME:$('cfgQBUsername').value,QB_PASSWORD:$('cfgQBPassword').value,RADARR_URL:$('cfgRadarrUrl').value,RADARR_API_KEY:$('cfgRadarrKey').value,SONARR_URL:$('cfgSonarrUrl').value,SONARR_API_KEY:$('cfgSonarrKey').value,DISCORD_BOT_TOKEN:$('cfgDiscordToken').value,DISCORD_CHANNEL_ID:$('cfgDiscordChannel').value,DISCORD_WEBHOOK_URL:$('cfgDiscordWebhook').value,TZ:$('cfgTZ').value};await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});alert('Connexions enregistrées.');refresh()}catch(e){alert(e.message)}}
-async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
+async function testConnection(kind){const el=$('test-'+kind);el.className='test-result warn';el.textContent='Test en cours…';try{const d=await api('/test/'+kind,{method:'POST'});el.className='test-result '+(d.ok?'ok':'bad');el.textContent=(d.ok?'✓ ':'✕ ')+d.message}catch(e){el.className='test-result bad';el.textContent='✕ '+e.message}}
+async function saveConnectionSettings(){try{const payload={QB_HOST:$('cfgQBHost').value,QB_USERNAME:$('cfgQBUsername').value,QB_PASSWORD:$('cfgQBPassword').value,RADARR_URL:$('cfgRadarrUrl').value,RADARR_API_KEY:$('cfgRadarrKey').value,SONARR_URL:$('cfgSonarrUrl').value,SONARR_API_KEY:$('cfgSonarrKey').value,DISCORD_BOT_TOKEN:$('cfgDiscordToken').value,DISCORD_CHANNEL_ID:$('cfgDiscordChannel').value,DISCORD_WEBHOOK_URL:$('cfgDiscordWebhook').value,TZ:$('cfgTZ').value};await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Connexions enregistrées.');refresh()}catch(e){alert(e.message)}}
+async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked,qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
 $('historyFilter').onchange=renderHistory;$('historySearch').oninput=renderHistory;
 async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}loadDashboard();refresh();
 </script></main></body></html>"""
@@ -3199,7 +3273,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.5.5",
+        "version": "2.5.6",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -3256,6 +3330,46 @@ def resolve_error(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
+@app.post("/test/qbittorrent")
+def test_qbittorrent() -> dict[str, Any]:
+    try:
+        qb_login()
+        torrents = get_torrents()
+        return {"ok": True, "message": f"qBittorrent connecté — {len(torrents)} torrent(s)."}
+    except Exception as exc:
+        return {"ok": False, "message": f"qBittorrent : {exc}"}
+
+
+@app.post("/test/radarr")
+def test_radarr() -> dict[str, Any]:
+    result = _arr_connection_status(RADARR_URL, RADARR_API_KEY)
+    if result.get("status") == "connected":
+        return {"ok": True, "message": f"Radarr connecté — version {result.get('version') or 'inconnue'}."}
+    return {"ok": False, "message": "Radarr : " + (result.get("error") or "connexion impossible")}
+
+
+@app.post("/test/sonarr")
+def test_sonarr() -> dict[str, Any]:
+    result = _arr_connection_status(SONARR_URL, SONARR_API_KEY)
+    if result.get("status") == "connected":
+        return {"ok": True, "message": f"Sonarr connecté — version {result.get('version') or 'inconnue'}."}
+    return {"ok": False, "message": "Sonarr : " + (result.get("error") or "connexion impossible")}
+
+
+@app.post("/test/discord")
+def test_discord() -> dict[str, Any]:
+    if discord is None:
+        return {"ok": False, "message": "Le module Discord n'est pas installé."}
+    if discord_bot is None or not discord_bot.is_ready():
+        return {"ok": False, "message": "Bot Discord non connecté. Vérifie la configuration et redémarre ForcedFR après un changement de token."}
+    try:
+        future = asyncio.run_coroutine_threadsafe(send_discord_test_message(), MAIN_EVENT_LOOP)
+        future.result(timeout=15)
+        return {"ok": True, "message": "Message de test envoyé dans Discord avec les boutons d'action."}
+    except Exception as exc:
+        return {"ok": False, "message": f"Discord : {exc}"}
+
+
 @app.get("/configuration")
 def configuration() -> dict[str, Any]:
     secret_keys = {"DISCORD_BOT_TOKEN", "DISCORD_WEBHOOK_URL", "QB_PASSWORD", "RADARR_API_KEY", "SONARR_API_KEY"}
@@ -3288,6 +3402,7 @@ def settings() -> dict[str, Any]:
     return {
         "notify_no_forced": _setting_bool("notify_no_forced", True),
         "notify_errors": _setting_bool("notify_errors", True),
+        "qb_ignored_tags": _setting("qb_ignored_tags", ""),
     }
 
 
@@ -3297,6 +3412,9 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
         set_setting("notify_no_forced", "1" if bool(payload["notify_no_forced"]) else "0")
     if "notify_errors" in payload:
         set_setting("notify_errors", "1" if bool(payload["notify_errors"]) else "0")
+    if "qb_ignored_tags" in payload:
+        tags = str(payload.get("qb_ignored_tags") or "")
+        set_setting("qb_ignored_tags", tags)
     return settings()
 
 
