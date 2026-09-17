@@ -94,7 +94,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.4.3",
+    version="2.4.4",
 )
 
 
