@@ -94,7 +94,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.4.4",
+    version="2.5.0",
 )
 
 
@@ -903,6 +903,8 @@ def build_release_fields(
 def notify_no_french_forced(
     torrent: dict[str, Any],
 ) -> None:
+    if not _setting_bool("notify_no_forced", True):
+        return
 
     torrent_hash = str(
         torrent.get("hash", "")
@@ -974,6 +976,8 @@ def notify_analysis_error(
     torrent: dict[str, Any],
     error: str,
 ) -> None:
+    if not _setting_bool("notify_errors", True):
+        return
 
     torrent_hash = str(
         torrent.get("hash", "")
@@ -1584,6 +1588,7 @@ def process_new_torrent(
                     ANALYSIS_TIMEOUT,
                 )
 
+                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", f"Timeout après {ANALYSIS_TIMEOUT} secondes.")
                 notify_analysis_error(
                     torrent,
                     f"Timeout après {ANALYSIS_TIMEOUT} secondes.",
@@ -1694,6 +1699,7 @@ def process_new_torrent(
                     torrent_hash,
                 )
 
+                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", "ffprobe a dépassé son délai de 60 secondes.")
                 notify_analysis_error(
                     torrent,
                     "ffprobe a dépassé son délai de 60 secondes.",
@@ -1710,6 +1716,7 @@ def process_new_torrent(
                     exc,
                 )
 
+                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", str(exc))
                 notify_analysis_error(
                     torrent,
                     str(exc),
@@ -1727,6 +1734,7 @@ def process_new_torrent(
                     exc,
                 )
 
+                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", str(exc))
                 notify_analysis_error(
                     torrent,
                     str(exc),
@@ -2290,7 +2298,125 @@ def init_database() -> None:
         """)
         conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_actions_hash ON torrent_actions(torrent_hash)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_actions_created_at ON torrent_actions(created_at DESC)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS library_errors (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                media_key TEXT UNIQUE NOT NULL,
+                media_type TEXT NOT NULL,
+                title TEXT,
+                path TEXT,
+                error TEXT NOT NULL,
+                first_seen REAL NOT NULL,
+                last_seen REAL NOT NULL,
+                resolved_at REAL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_library_errors_last_seen ON library_errors(last_seen DESC)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_library_errors_resolved ON library_errors(resolved_at)")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS forcedfr_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at REAL NOT NULL
+            )
+        """)
+        defaults = {
+            "notify_no_forced": "1",
+            "notify_errors": "1",
+            "library_profile_films": "strict",
+            "library_profile_series": "strict",
+        }
+        for key, value in defaults.items():
+            conn.execute(
+                "INSERT OR IGNORE INTO forcedfr_settings(key,value,updated_at) VALUES (?,?,?)",
+                (key, value, time.time()),
+            )
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS forcedfr_profiles (
+                name TEXT PRIMARY KEY,
+                media_type TEXT NOT NULL,
+                forced_required INTEGER NOT NULL DEFAULT 1,
+                missing_action TEXT NOT NULL DEFAULT 'review',
+                error_action TEXT NOT NULL DEFAULT 'notify_continue',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                updated_at REAL NOT NULL
+            )
+        """)
+        for name, media_type in (("strict", "Film"), ("strict_series", "Série")):
+            conn.execute(
+                "INSERT OR IGNORE INTO forcedfr_profiles(name,media_type,forced_required,missing_action,error_action,enabled,updated_at) VALUES (?,?,?,?,?,?,?)",
+                (name, media_type, 1, "review", "notify_continue", 1, time.time()),
+            )
     log.info("SQLite initialisée : %s", SQLITE_PATH)
+
+
+def _setting(key: str, default: str = "") -> str:
+    try:
+        with _db_connect() as conn:
+            row = conn.execute("SELECT value FROM forcedfr_settings WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row else default
+    except Exception:
+        return default
+
+
+def _setting_bool(key: str, default: bool = True) -> bool:
+    return _setting(key, "1" if default else "0") == "1"
+
+
+def set_setting(key: str, value: str) -> None:
+    with _db_connect() as conn:
+        conn.execute(
+            "INSERT INTO forcedfr_settings(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, str(value), time.time()),
+        )
+
+
+def record_library_error(item: dict[str, Any], file_path: Path | None, error: str) -> None:
+    key = _media_cache_key(item, file_path) if file_path else f"{item.get('type','')}|{item.get('raw_path') or item.get('title','')}"
+    now = time.time()
+    with _db_connect() as conn:
+        conn.execute("""
+            INSERT INTO library_errors(media_key,media_type,title,path,error,first_seen,last_seen,resolved_at)
+            VALUES (?,?,?,?,?,?,?,NULL)
+            ON CONFLICT(media_key) DO UPDATE SET
+                media_type=excluded.media_type,title=excluded.title,path=excluded.path,
+                error=excluded.error,last_seen=excluded.last_seen,resolved_at=NULL
+        """, (key, item.get("type", "inconnu"), item.get("title"), str(file_path) if file_path else item.get("raw_path"), str(error), now, now))
+
+
+def resolve_library_error(item: dict[str, Any], file_path: Path | None) -> None:
+    key = _media_cache_key(item, file_path) if file_path else f"{item.get('type','')}|{item.get('raw_path') or item.get('title','')}"
+    with _db_connect() as conn:
+        conn.execute("UPDATE library_errors SET resolved_at=? WHERE media_key=? AND resolved_at IS NULL", (time.time(), key))
+
+
+def get_library_errors(include_resolved: bool = False, limit: int = 200) -> list[dict[str, Any]]:
+    with _db_connect() as conn:
+        where = "" if include_resolved else "WHERE resolved_at IS NULL"
+        rows = conn.execute(f"SELECT * FROM library_errors {where} ORDER BY last_seen DESC LIMIT ?", (max(1, min(limit, 1000)),)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_dashboard_stats() -> dict[str, Any]:
+    with _db_connect() as conn:
+        lib = conn.execute("SELECT COUNT(*) total, SUM(CASE WHEN forced_french=1 THEN 1 ELSE 0 END) forced, SUM(CASE WHEN forced_french=0 THEN 1 ELSE 0 END) no_forced FROM library_analysis").fetchone()
+        pending = conn.execute("SELECT COUNT(*) FROM library_analysis WHERE forced_french=0 AND review_status='pending'").fetchone()[0]
+        waiting = conn.execute("SELECT COUNT(*) FROM library_analysis WHERE forced_french=0 AND review_status='waiting_replacement'").fetchone()[0]
+        validated = conn.execute("SELECT COUNT(*) FROM library_analysis WHERE forced_french=0 AND review_status='validated'").fetchone()[0]
+        errors = conn.execute("SELECT COUNT(*) FROM library_errors WHERE resolved_at IS NULL").fetchone()[0]
+        torrent_total = conn.execute("SELECT COUNT(*) FROM torrent_analysis").fetchone()[0]
+        torrent_forced = conn.execute("SELECT COUNT(*) FROM torrent_analysis WHERE forced_french=1").fetchone()[0]
+        torrent_no_forced = conn.execute("SELECT COUNT(*) FROM torrent_analysis WHERE result='no_forced'").fetchone()[0]
+        torrent_errors = conn.execute("SELECT COUNT(*) FROM torrent_analysis WHERE result='error'").fetchone()[0]
+        recent = conn.execute("SELECT action, details, created_at FROM torrent_actions ORDER BY created_at DESC LIMIT 8").fetchall()
+    return {
+        "library": {"total": int(lib["total"] or 0), "forced": int(lib["forced"] or 0), "no_forced": int(lib["no_forced"] or 0), "pending": pending, "waiting": waiting, "validated": validated, "errors": errors},
+        "torrents": {"total": torrent_total, "forced": torrent_forced, "no_forced": torrent_no_forced, "errors": torrent_errors},
+        "recent": [dict(r) for r in recent],
+    }
 
 
 def _media_cache_key(item: dict[str, Any], file_path: Path) -> str:
@@ -2742,6 +2868,23 @@ def _scan_items(scope: str) -> list[dict[str, Any]]:
     return items
 
 
+def _profile_for_media(media_type: str) -> dict[str, Any] | None:
+    name = "strict_series" if media_type == "Série" else "strict"
+    with _db_connect() as conn:
+        row = conn.execute("SELECT * FROM forcedfr_profiles WHERE name=? AND enabled=1", (name,)).fetchone()
+    return dict(row) if row else None
+
+
+def _review_status_from_profile(media_type: str) -> str:
+    profile = _profile_for_media(media_type)
+    action = (profile or {}).get("missing_action", "review")
+    return {
+        "validated": "validated",
+        "waiting_replacement": "waiting_replacement",
+        "review": "pending",
+    }.get(action, "pending")
+
+
 def run_library_scan(scope: str, mode: str = "incremental") -> None:
     if not scan_lock.acquire(blocking=False):
         log.warning("Un scan de bibliothèque est déjà en cours.")
@@ -2774,7 +2917,7 @@ def run_library_scan(scope: str, mode: str = "incremental") -> None:
                 "forced_tracks": [],
                 "subtitles": [],
                 "media_key": _media_review_key(item, file_path) if file_path else None,
-                "review_status": "pending",
+                "review_status": _review_status_from_profile(str(item.get("type", "Film"))),
                 "reviewed_at": None,
                 "review_note": None,
             }
@@ -2803,20 +2946,29 @@ def run_library_scan(scope: str, mode: str = "incremental") -> None:
                     _save_cached_analysis(item, file_path, detection)
                     saved = _cached_analysis(item, file_path)
                     if saved:
-                        result["review_status"] = saved.get("review_status", "pending")
+                        result["review_status"] = saved.get("review_status", result["review_status"])
                         result["reviewed_at"] = saved.get("reviewed_at")
                         result["review_note"] = saved.get("review_note")
+                    if not result["forced_french"]:
+                        profile_status = _review_status_from_profile(str(item.get("type", "Film")))
+                        if profile_status != "pending":
+                            set_media_review(result["media_key"], profile_status, "Décision appliquée par le profil ForcedFR.")
+                            result["review_status"] = profile_status
+                            result["reviewed_at"] = time.time()
+                            result["review_note"] = "Décision appliquée par le profil ForcedFR."
                     scan_state["reanalyzed"] += 1
                 if result["forced_french"]:
                     scan_state["files_with_forced_fr"] += 1
                 else:
                     scan_state["files_without_forced_fr"] += 1
+                resolve_library_error(item, file_path)
 
                 scan_state["results"].append(result)
             except Exception as exc:
                 result["status"] = "error"
                 result["error"] = str(exc)
                 scan_state["errors"] += 1
+                record_library_error(item, file_path, str(exc))
                 scan_state["results"].append(result)
                 log.warning("[SCAN] Erreur sur %s : %s", raw_path or item.get("title"), exc)
             finally:
@@ -2864,7 +3016,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.4.3</title>
+<title>ForcedFR v2.5.0</title>
 <style>
 :root{color-scheme:dark;--bg:#0d1117;--p:#161b22;--b:#30363d;--m:#8b949e;--t:#e6edf3;--g:#3fb950;--y:#d29922;--r:#f85149;font-family:Inter,system-ui,sans-serif}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--t)}main{max-width:1320px;margin:auto;padding:28px}h1{margin:0}.sub,.small{color:var(--m)}
@@ -2878,7 +3030,7 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 .badge{font-weight:700}.yes{color:var(--g)}.no{color:var(--r)}.err{color:var(--y)}a.btn{display:inline-block;background:#1f6feb;color:white;text-decoration:none;padding:7px 10px;border-radius:7px;font-size:.82rem;margin:2px 4px 2px 0;white-space:nowrap}
 .empty{color:var(--m);text-align:center;padding:22px}@media(max-width:700px){main{padding:16px}}
 </style></head><body><main>
-<h1>ForcedFR <span class="small">v2.4.3</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<h1>ForcedFR <span class="small">v2.5.0</span></h1><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="grid">
 <div class="card"><div class="label">ForcedFR</div><div class="value ok">● En ligne</div></div>
 <div class="card"><div class="label">qBittorrent</div><div class="value" id="qb">…</div></div>
@@ -2886,9 +3038,14 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 <div class="card"><div class="label">Radarr</div><div class="value" id="radarr">…</div></div>
 <div class="card"><div class="label">Sonarr</div><div class="value" id="sonarr">…</div></div></div>
 
-<div class="tabs"><button class="tab active" data-tab="scan">🔍 Scan de bibliothèque</button><button class="tab" data-tab="history">📜 Historique des analyses</button></div>
+<div class="tabs"><button class="tab active" data-tab="dashboard">📊 Tableau de bord</button><button class="tab" data-tab="scan">🔍 Scan de bibliothèque</button><button class="tab" data-tab="history">📜 Historique</button><button class="tab" data-tab="errors">⚠ Erreurs</button><button class="tab" data-tab="settings">⚙ Paramètres</button></div>
 
-<section id="p-scan" class="panel active">
+<section id="p-dashboard" class="panel active">
+<div class="grid" id="dashCards"></div>
+<div class="card" style="margin-top:14px"><h2>Activité récente</h2><div class="tablewrap"><table><thead><tr><th>Date</th><th>Action</th><th>Détails</th></tr></thead><tbody id="recent"></tbody></table></div></div>
+</section>
+
+<section id="p-scan" class="panel">
 <div class="card"><div class="toolbar"><button onclick="startScan('films','incremental')">⚡ Films incrémental</button><button onclick="startScan('films','full')">🎬 Films complet</button><button onclick="startScan('series','incremental')">⚡ Séries incrémental</button><button onclick="startScan('series','full')">📺 Séries complet</button><button onclick="startScan('all','incremental')">⚡ Toute la bibliothèque</button></div>
 <div class="small" id="scanLabel">Aucun scan en cours.</div><div class="progress"><div id="bar"></div></div><div class="small" id="stats"></div></div>
 <div class="subtabs" style="margin:20px 0"><button class="subtab active" data-kind="films">🎬 Films</button><button class="subtab" data-kind="series">📺 Séries</button></div>
@@ -2900,7 +3057,11 @@ select,input{background:#0f141b;color:white;border:1px solid var(--b);border-rad
 <div class="tablewrap"><table><thead><tr><th>Série</th><th>Saison</th><th>Épisode</th><th>Forced FR</th><th>Action</th></tr></thead><tbody id="series"></tbody></table></div></div>
 </section>
 
-<section id="p-history" class="panel"><h2>Historique des analyses</h2><p class="sub">Historique persistant des analyses et décisions prises sur les téléchargements.</p>
+<section id="p-errors" class="panel"><h2>Erreurs à traiter</h2><p class="sub">Erreurs persistantes du scan de bibliothèque. Une réussite lors d'un prochain scan les clôture automatiquement.</p><div class="toolbar"><button onclick="startScan('films','incremental')">↻ Relancer Films</button><button onclick="startScan('series','incremental')">↻ Relancer Séries</button><button onclick="startScan('all','incremental')">↻ Relancer toute la bibliothèque</button></div><div class="tablewrap" style="margin-top:14px"><table><thead><tr><th>Dernière détection</th><th>Média</th><th>Erreur</th><th>Action</th></tr></thead><tbody id="errors"></tbody></table></div></section>
+
+<section id="p-settings" class="panel"><h2>Paramètres</h2><p class="sub">Réglages persistants enregistrés dans SQLite.</p><div class="card"><label><input type="checkbox" id="setNoForced"> Notification Discord si Forced FR absent</label><br><br><label><input type="checkbox" id="setErrors"> Notification Discord en cas d'erreur</label><br><br><button onclick="saveSettings()">Enregistrer</button></div><h2 style="margin-top:24px">Profils</h2><p class="sub">Base de profils prête pour les futures règles automatiques Films / Séries.</p><div class="tablewrap"><table><thead><tr><th>Profil</th><th>Type</th><th>Forced obligatoire</th><th>Si absent</th><th>Si erreur</th><th>Actif</th><th></th></tr></thead><tbody id="profiles"></tbody></table></div></section>
+
+<section id="p-history" class="panel"><h2>Historique des analyses</h2><p class="sub">Historique persistant des analyses et décisions prises sur les téléchargements.</p><div class="filters"><select id="historyFilter"><option value="all">Toutes les analyses</option><option value="forced_found">Forced FR détecté</option><option value="no_forced">Pas de Forced FR</option><option value="error">Erreurs</option></select><input id="historySearch" placeholder="Rechercher un torrent…"></div>
 <div class="tablewrap"><table><thead><tr><th>Date</th><th>Torrent</th><th>Résultat</th><th>Décision</th><th>Action</th></tr></thead><tbody id="history"></tbody></table></div></section>
 
 <script>
@@ -2908,7 +3069,7 @@ const $=x=>document.getElementById(x);let data=[],prev=false,loaded=false,timer;
 async function api(u,o={}){const r=await fetch(u,o),d=await r.json();if(!r.ok)throw Error(d.detail||'Erreur');return d}
 function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#039;'}[c]))}
 function st(id,s,e=''){const m={connected:['● Connecté','ok'],connecting:['● Connexion…','warn'],disabled:['● Désactivé','warn'],error:['● Indisponible','bad'],not_configured:['● Non configuré','warn'],unknown:['● Inconnu','warn']}[s]||['● '+s,'warn'];$(id).textContent=m[0]+(e?' '+e:'');$(id).className='value '+m[1]}
-document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));$('p-'+b.dataset.tab).classList.add('active');if(b.dataset.tab==='history')loadHistory()});
+document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));$('p-'+b.dataset.tab).classList.add('active');if(b.dataset.tab==='history')loadHistory();if(b.dataset.tab==='dashboard')loadDashboard();if(b.dataset.tab==='errors')loadErrors();if(b.dataset.tab==='settings')loadSettings()});
 document.querySelectorAll('.subtab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.subtab').forEach(x=>x.classList.toggle('active',x===b));['films','series'].forEach(k=>$('k-'+k).style.display=k===b.dataset.kind?'block':'none')});
 async function startScan(s,m='incremental'){try{await api('/scan/'+s+'?mode='+encodeURIComponent(m),{method:'POST'});loaded=false;refresh()}catch(e){alert(e.message)}}
 function rows(kind){const f=$(kind==='films'?'ff':'sf').value,q=$(kind==='films'?'fs':'ss').value.toLowerCase();return data.filter(i=>(kind==='films'?i.type==='Film':i.type==='Série')).filter(i=>{const rs=i.review_status||'pending';if(f==='all')return true;if(f==='error')return i.status==='error';if(f==='yes')return i.status!=='error'&&i.forced_french;if(f==='no')return i.status!=='error'&&!i.forced_french;if(f==='pending')return i.status!=='error'&&!i.forced_french&&rs==='pending';if(f==='validated')return i.status!=='error'&&!i.forced_french&&rs==='validated';if(f==='waiting')return i.status!=='error'&&!i.forced_french&&rs==='waiting_replacement';return true}).filter(i=>!q||(i.title+' '+(i.season||'')+' '+(i.episode||'')).toLowerCase().includes(q))}
@@ -2922,8 +3083,17 @@ async function loadResults(){data=(await api('/scan/results')).results||[];rende
 ['ff','fs'].forEach(id=>$(id).oninput=()=>render('films'));['sf','ss'].forEach(id=>$(id).oninput=()=>render('series'));
 function historyResult(i){const m={forced_found:'<span class="badge yes">✅ Forced FR détecté</span>',no_forced:'<span class="badge no">❌ Pas de Forced FR</span>',error:'<span class="badge err">⚠ Erreur d’analyse</span>'};return m[i.result]||'<span class="badge">'+esc(i.result||'—')+'</span>'}
 function historyDecision(i){const m={auto_pause:'<span class="badge no">⏸ Pause automatique</span>',pause:'<span class="badge no">⏸ Maintenu en pause</span>',resume:'<span class="badge yes">▶ Téléchargement repris</span>'};if(m[i.last_action])return m[i.last_action];if(i.result==='no_forced')return '<span class="badge no">⏸ Pause automatique</span>';return '—'}
-async function loadHistory(){const d=await api('/history');$('history').innerHTML=d.results.length?d.results.map(i=>{const actions=[];if(i.tracker_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.tracker_url)+'">Voir le torrent</a>');if(i.qb_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.qb_url)+'">qBittorrent</a>');if(i.arr_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">'+esc(i.arr_source==='Sonarr'?'Sonarr':'Radarr')+'</a>');return '<tr><td>'+new Date(i.timestamp*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td title="'+esc(i.torrent_name)+'">'+esc(i.torrent_name)+'</td><td>'+historyResult(i)+'</td><td>'+historyDecision(i)+'</td><td>'+actions.join(' ')+'</td></tr>'}).join(''):'<tr><td colspan="5" class="empty">Aucune analyse enregistrée.</td></tr>'}
-async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}refresh();
+async function loadHistory(){const d=await api('/history');window.historyData=d.results||[];renderHistory()}
+function renderHistory(){const q=($('historySearch')?.value||'').toLowerCase(),f=$('historyFilter')?.value||'all';const r=(window.historyData||[]).filter(i=>!q||(i.torrent_name||'').toLowerCase().includes(q)).filter(i=>f==='all'||i.result===f);$('history').innerHTML=r.length?r.map(i=>{const actions=[];if(i.tracker_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.tracker_url)+'">Voir le torrent</a>');if(i.qb_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.qb_url)+'">qBittorrent</a>');if(i.arr_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">'+esc(i.arr_source==='Sonarr'?'Sonarr':'Radarr')+'</a>');return '<tr><td>'+new Date(i.timestamp*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td title="'+esc(i.torrent_name)+'">'+esc(i.torrent_name)+'</td><td>'+historyResult(i)+'</td><td>'+historyDecision(i)+'</td><td>'+actions.join(' ')+'</td></tr>'}).join(''):'<tr><td colspan="5" class="empty">Aucune analyse correspondante.</td></tr>'}
+
+async function loadDashboard(){const d=await api('/dashboard/stats');const l=d.library,t=d.torrents;const cards=[['Bibliothèque',l.total,'médias'],['Avec Forced FR',l.forced,'validés'],['Sans Forced FR',l.no_forced,'médias'],['🔴 À traiter',l.pending,'médias'],['🟠 En attente',l.waiting,'médias'],['🟢 Absence normale',l.validated,'médias'],['⚠ Erreurs',l.errors,'à traiter'],['Torrents analysés',t.total,'analyses']];$('dashCards').innerHTML=cards.map(c=>'<div class="card"><div class="label">'+c[0]+'</div><div class="value" style="font-size:1.5rem">'+c[1]+'</div><div class="small">'+c[2]+'</div></div>').join('');$('recent').innerHTML=d.recent.length?d.recent.map(i=>'<tr><td>'+new Date(i.created_at*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td>'+esc(i.action)+'</td><td>'+esc(i.details||'—')+'</td></tr>').join(''):'<tr><td colspan="3" class="empty">Aucune activité.</td></tr>'}
+async function loadErrors(){const d=await api('/errors');$('errors').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.last_seen*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td><strong>'+esc(i.title||'—')+'</strong><div class="small">'+esc(i.media_type)+' · '+esc(i.path||'')+'</div></td><td>'+esc(i.error)+'</td><td><button class="review-btn" onclick="resolveError('+i.id+')">✓ Marquer traité</button></td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune erreur à traiter.</td></tr>'}
+async function resolveError(id){try{await api('/errors/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadErrors();loadDashboard()}catch(e){alert(e.message)}}
+async function loadSettings(){const [s,p]=await Promise.all([api('/settings'),api('/profiles')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('profiles').innerHTML=p.results.map(i=>'<tr><td><strong>'+esc(i.name)+'</strong></td><td>'+esc(i.media_type)+'</td><td>'+(i.forced_required?'Oui':'Non')+'</td><td><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre</option></select></td><td>'+esc(i.error_action)+'</td><td><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+'></td><td><button onclick="saveProfile(''+esc(i.name)+'',''+esc(i.media_type)+'','+(i.forced_required?'true':'false')+')">Enregistrer</button></td></tr>').join('')}
+async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,error_action:'notify_continue',enabled:$('ena-'+name).checked})});alert('Profil enregistré. Les nouveaux médias analysés utiliseront ce réglage.')}catch(e){alert(e.message)}}
+async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
+$('historyFilter').onchange=renderHistory;$('historySearch').oninput=renderHistory;
+async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}loadDashboard();refresh();
 </script></main></body></html>"""
 
 
@@ -2935,7 +3105,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.4.3",
+        "version": "2.5.0",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -2968,6 +3138,69 @@ def status() -> dict[str, Any]:
             "path_mappings_configured": len(ARR_PATH_MAPPINGS),
         },
     }
+
+
+@app.get("/dashboard/stats")
+def dashboard_stats() -> dict[str, Any]:
+    return get_dashboard_stats()
+
+
+@app.get("/errors")
+def library_errors(include_resolved: bool = False) -> dict[str, Any]:
+    return {"results": get_library_errors(include_resolved=include_resolved)}
+
+
+@app.post("/errors/resolve")
+def resolve_error(payload: dict[str, Any]) -> dict[str, Any]:
+    error_id = int(payload.get("id") or 0)
+    if error_id <= 0:
+        raise HTTPException(status_code=400, detail="Identifiant d'erreur invalide.")
+    with _db_connect() as conn:
+        cur = conn.execute("UPDATE library_errors SET resolved_at=? WHERE id=?", (time.time(), error_id))
+    if cur.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Erreur introuvable.")
+    return {"ok": True}
+
+
+@app.get("/settings")
+def settings() -> dict[str, Any]:
+    return {
+        "notify_no_forced": _setting_bool("notify_no_forced", True),
+        "notify_errors": _setting_bool("notify_errors", True),
+    }
+
+
+@app.post("/settings")
+def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    if "notify_no_forced" in payload:
+        set_setting("notify_no_forced", "1" if bool(payload["notify_no_forced"]) else "0")
+    if "notify_errors" in payload:
+        set_setting("notify_errors", "1" if bool(payload["notify_errors"]) else "0")
+    return settings()
+
+
+@app.get("/profiles")
+def profiles() -> dict[str, Any]:
+    with _db_connect() as conn:
+        rows = conn.execute("SELECT * FROM forcedfr_profiles ORDER BY media_type, name").fetchall()
+    return {"results": [dict(r) for r in rows]}
+
+
+@app.post("/profiles")
+def update_profile(payload: dict[str, Any]) -> dict[str, Any]:
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Nom de profil manquant.")
+    media_type = str(payload.get("media_type") or "Film")
+    if media_type not in {"Film", "Série"}:
+        raise HTTPException(status_code=400, detail="Type de média invalide.")
+    with _db_connect() as conn:
+        conn.execute("""
+            INSERT INTO forcedfr_profiles(name,media_type,forced_required,missing_action,error_action,enabled,updated_at)
+            VALUES (?,?,?,?,?,?,?)
+            ON CONFLICT(name) DO UPDATE SET media_type=excluded.media_type,forced_required=excluded.forced_required,missing_action=excluded.missing_action,error_action=excluded.error_action,enabled=excluded.enabled,updated_at=excluded.updated_at
+        """, (name, media_type, int(bool(payload.get("forced_required", True))), str(payload.get("missing_action") or "review"), str(payload.get("error_action") or "notify_continue"), int(bool(payload.get("enabled", True))), time.time()))
+    return {"ok": True}
 
 
 @app.get("/history")
