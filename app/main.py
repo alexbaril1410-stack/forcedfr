@@ -94,7 +94,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.5.6",
+    version="2.5.7",
 )
 
 
@@ -1008,86 +1008,54 @@ def notify_no_french_forced(
     )
 
 
-def notify_analysis_error(
-    torrent: dict[str, Any],
-    error: str,
-) -> None:
-    if not _setting_bool("notify_errors", True):
-        return
-
-    torrent_hash = str(
-        torrent.get("hash", "")
-    )
-
-    release = wait_for_release_context(
-        torrent_hash
-    )
-
-    # Aucun message Discord sans URL de la page du torrent.
+def notify_profile_decision(torrent: dict[str, Any], title: str, description: str, action_text: str, release: dict[str, Any] | None = None) -> None:
+    torrent_hash = str(torrent.get("hash", ""))
     if release is None:
-        log.warning(
-            "[%s] Notification Discord non envoyée : "
-            "URL du torrent indisponible.",
-            torrent_hash,
-        )
-        return
+        try:
+            release = wait_for_release_context(torrent_hash)
+        except Exception:
+            release = None
+    if release is None:
+        release = {"source": None, "title": torrent.get("name"), "indexer": None, "tracker_url": None, "arr_item_url": None, "item_id": None}
+    else:
+        update_torrent_release_context(torrent_hash, release)
+    fields = build_release_fields(torrent, release)
+    fields.append({"name": "Action ForcedFR", "value": action_text, "inline": False})
+    send_discord_message(embeds=[{"title": title, "description": description, "color": 5763719, "fields": fields, "footer": {"text": "ForcedFR • Notification"}}], torrent_hash=torrent_hash, release=release)
 
-    update_torrent_release_context(torrent_hash, release)
 
-    fields = build_release_fields(
-        torrent,
-        release,
-    )
+def notify_analysis_error(torrent: dict[str, Any], error: str, *, action_text: str, attempt: int | None = None, release: dict[str, Any] | None = None) -> None:
+    torrent_hash=str(torrent.get("hash",""))
+    if release is None:
+        try: release=wait_for_release_context(torrent_hash)
+        except Exception: release=None
+    if release is None:
+        release={"source":None,"title":torrent.get("name"),"indexer":None,"tracker_url":None,"arr_item_url":None,"item_id":None}
+    else: update_torrent_release_context(torrent_hash,release)
+    fields=build_release_fields(torrent,release)
+    text=str(error).strip() or "Erreur inconnue"
+    fields += [{"name":"Erreur d'analyse","value":f"```{text[:1000]}```","inline":False},{"name":"Action ForcedFR","value":action_text,"inline":False}]
+    if attempt is not None: fields.append({"name":"Tentative","value":str(attempt),"inline":True})
+    send_discord_message(embeds=[{"title":"⚠️ Erreur pendant l'analyse ForcedFR","description":"ForcedFR n'a pas pu déterminer le résultat de manière fiable.","color":16776960,"fields":fields,"footer":{"text":"ForcedFR • Erreur d'analyse"}}],torrent_hash=torrent_hash,release=release)
 
-    error_text = str(
-        error
-    ).strip() or "Erreur inconnue"
 
-    fields.extend(
-        [
-            {
-                "name": "Erreur d'analyse",
-                "value": f"```{error_text[:1000]}```",
-                "inline": False,
-            },
-            {
-                "name": "Action effectuée",
-                "value": (
-                    "▶️ Le téléchargement continue automatiquement."
-                ),
-                "inline": False,
-            },
-            {
-                "name": "Que faire ?",
-                "value": (
-                    "ForcedFR n'a pas pu déterminer le résultat de manière fiable. "
-                    "Une vérification manuelle est recommandée."
-                ),
-                "inline": False,
-            },
-        ]
-    )
-
-    send_discord_message(
-        embeds=[
-            {
-                "title": "⚠️ Erreur pendant l'analyse ForcedFR",
-                "description": (
-                    "Le torrent n'a pas été bloqué afin d'éviter "
-                    "une interruption injustifiée du téléchargement."
-                ),
-                "color": 16776960,
-                "fields": fields,
-                "footer": {
-                    "text": (
-                        "ForcedFR • Téléchargement laissé en cours"
-                    ),
-                },
-            }
-        ],
-        torrent_hash=torrent_hash,
-        release=release,
-    )
+def apply_analysis_error_policy(torrent: dict[str, Any], error: str, error_count: int) -> bool:
+    profile,release=_error_profile_for_torrent(torrent)
+    policy=str(profile.get("error_action") or "notify_continue")
+    retries=max(1,min(20,int(profile.get("error_retries") or 5)))
+    delay=max(1.0,min(3600.0,float(profile.get("error_retry_delay") or 30)))
+    if policy in {"retry_pause","retry_continue"} and error_count <= retries:
+        notify_analysis_error(torrent,error,action_text=f"🔄 Nouvelle tentative dans {delay:g} seconde(s) ({error_count}/{retries}).",attempt=error_count,release=release)
+        time.sleep(delay); return True
+    if policy=="retry_pause":
+        stop_torrent(str(torrent.get("hash",""))); text="⏸️ Après les tentatives prévues, le téléchargement a été mis en pause."
+    elif policy=="retry_continue":
+        start_torrent(str(torrent.get("hash",""))); text="▶️ Après les tentatives prévues, le téléchargement continue."
+    elif policy=="pause_decision":
+        stop_torrent(str(torrent.get("hash",""))); text="⏸️ Le téléchargement est en pause. Utilise les boutons Discord pour décider de continuer ou de le laisser en pause."
+    else:
+        text="▶️ Le téléchargement continue. Une vérification manuelle est recommandée."
+    notify_analysis_error(torrent,error,action_text=text,attempt=error_count,release=release); return False
 
 
 # ============================================================
@@ -1574,6 +1542,7 @@ def process_new_torrent(
     )
 
     started_at = time.time()
+    real_error_count = 0
 
     # --------------------------------------------------------
     # ACTIVER LA PRIORITÉ IMMÉDIATEMENT
@@ -1679,12 +1648,20 @@ def process_new_torrent(
                         "[%s] ✅ FR Forced détecté.",
                         torrent_hash,
                     )
-                    record_analysis_history(
-                        torrent_hash,
-                        str(torrent.get("name", "")),
-                        "forced_found",
-                        "Piste FR Forced détectée.",
-                    )
+                    profile, release = _torrent_profile_for_torrent(torrent)
+                    found_action = str(profile.get("found_action") or "validate")
+                    name = str(torrent.get("name", ""))
+                    if found_action == "pause_notify":
+                        stop_torrent(torrent_hash)
+                        action_text = "⏸️ Torrent mis en pause. Forced FR détecté."
+                        record_torrent_action(torrent_hash, "auto_pause", source="forcedfr", details="Pause après détection d'une piste FR Forced.")
+                        notify_profile_decision(torrent, "🇫🇷 Forced FR détecté", f"Une piste française Forced a été détectée dans **{name}**.", action_text, release)
+                    elif found_action == "validate_notify":
+                        action_text = "🔔 Torrent validé et notification envoyée. Le téléchargement poursuit son cours."
+                        notify_profile_decision(torrent, "🇫🇷 Forced FR détecté", f"Une piste française Forced a été détectée dans **{name}**.", action_text, release)
+                    else:
+                        action_text = "✓️ Torrent validé. Le téléchargement poursuit son cours."
+                    record_analysis_history(torrent_hash, name, "forced_found", action_text)
                     return
 
                 # ------------------------------------------------
@@ -1697,27 +1674,23 @@ def process_new_torrent(
                     torrent_hash,
                 )
 
-                stop_torrent(
-                    torrent_hash
-                )
-
-                record_analysis_history(
-                    torrent_hash,
-                    str(torrent.get("name", "")),
-                    "no_forced",
-                    "Aucune piste FR Forced détectée. Torrent mis en pause.",
-                )
-                record_torrent_action(
-                    torrent_hash,
-                    "auto_pause",
-                    source="forcedfr",
-                    details="Torrent mis en pause automatiquement après analyse sans piste FR Forced.",
-                )
-
-                notify_no_french_forced(
-                    torrent
-                )
-
+                profile, release = _torrent_profile_for_torrent(torrent)
+                missing_action = str(profile.get("torrent_missing_action") or "pause_notify")
+                name = str(torrent.get("name", ""))
+                if missing_action == "continue_notify":
+                    start_torrent(torrent_hash)
+                    action_text = "▶️ Téléchargement poursuivi. Aucune piste FR Forced détectée."
+                    record_torrent_action(torrent_hash, "resume", source="forcedfr", details="Téléchargement poursuivi après analyse sans piste FR Forced.")
+                elif missing_action == "pause_decision":
+                    stop_torrent(torrent_hash)
+                    action_text = "⏸️ Torrent mis en pause. Une décision est demandée dans Discord."
+                    record_torrent_action(torrent_hash, "auto_pause", source="forcedfr", details="Torrent mis en pause en attente d'une décision Discord.")
+                else:
+                    stop_torrent(torrent_hash)
+                    action_text = "⏸️ Torrent mis en pause. Aucune piste FR Forced détectée."
+                    record_torrent_action(torrent_hash, "auto_pause", source="forcedfr", details="Torrent mis en pause après analyse sans piste FR Forced.")
+                notify_profile_decision(torrent, "🚨 Aucun Forced FR détecté", f"Aucune piste française Forced n'a été trouvée dans **{name}**.", action_text, release)
+                record_analysis_history(torrent_hash, name, "no_forced", action_text)
                 return
 
             except FileNotFoundError:
@@ -1744,13 +1717,10 @@ def process_new_torrent(
                     torrent_hash,
                 )
 
-                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", "ffprobe a dépassé son délai de 60 secondes.")
-                notify_analysis_error(
-                    torrent,
-                    "ffprobe a dépassé son délai de 60 secondes.",
-                )
-
-                # Le torrent est volontairement laissé en cours.
+                real_error_count += 1
+                error_text = "ffprobe a dépassé son délai de 60 secondes."
+                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", error_text)
+                if apply_analysis_error_policy(torrent,error_text,real_error_count): continue
                 return
 
             except RuntimeError as exc:
@@ -1761,13 +1731,10 @@ def process_new_torrent(
                     exc,
                 )
 
-                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", str(exc))
-                notify_analysis_error(
-                    torrent,
-                    str(exc),
-                )
-
-                # Le torrent est volontairement laissé en cours.
+                real_error_count += 1
+                error_text = str(exc)
+                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", error_text)
+                if apply_analysis_error_policy(torrent,error_text,real_error_count): continue
                 return
 
             except Exception as exc:
@@ -1779,13 +1746,10 @@ def process_new_torrent(
                     exc,
                 )
 
-                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", str(exc))
-                notify_analysis_error(
-                    torrent,
-                    str(exc),
-                )
-
-                # Le torrent est volontairement laissé en cours.
+                real_error_count += 1
+                error_text = str(exc)
+                record_analysis_history(torrent_hash, str(torrent.get("name", "")), "error", error_text)
+                if apply_analysis_error_policy(torrent,error_text,real_error_count): continue
                 return
 
             time.sleep(ANALYSIS_POLL_SECONDS)
@@ -2088,7 +2052,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.5.6",
+        "version": "2.5.7",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -2405,6 +2369,15 @@ def init_database() -> None:
                 "INSERT OR IGNORE INTO forcedfr_profiles(name,media_type,forced_required,missing_action,error_action,enabled,updated_at) VALUES (?,?,?,?,?,?,?)",
                 (name, media_type, 1, "review", "notify_continue", 1, time.time()),
             )
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(forcedfr_profiles)").fetchall()}
+        if "error_retries" not in cols:
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN error_retries INTEGER NOT NULL DEFAULT 5")
+        if "error_retry_delay" not in cols:
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN error_retry_delay REAL NOT NULL DEFAULT 30")
+        if "found_action" not in cols:
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN found_action TEXT NOT NULL DEFAULT 'validate'")
+        if "torrent_missing_action" not in cols:
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN torrent_missing_action TEXT NOT NULL DEFAULT 'pause_notify'")
     log.info("SQLite initialisée : %s", SQLITE_PATH)
 
 
@@ -2427,6 +2400,14 @@ def set_setting(key: str, value: str) -> None:
             "INSERT INTO forcedfr_settings(key,value,updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
             (key, str(value), time.time()),
         )
+
+
+def get_qbittorrent_tags() -> list[str]:
+    try:
+        r=qb_session.get(f"{QB_HOST}/api/v2/torrents/tags",timeout=5); r.raise_for_status(); data=r.json()
+        return sorted({str(x).strip() for x in data if str(x).strip()}, key=str.casefold) if isinstance(data,list) else []
+    except Exception as exc:
+        log.warning("Impossible de récupérer les étiquettes qBittorrent : %s",exc); return []
 
 
 def get_ignored_qb_tags() -> set[str]:
@@ -3024,6 +3005,26 @@ def _profile_for_media(media_type: str) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def _torrent_profile_for_torrent(torrent: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    release = None
+    try:
+        release = wait_for_release_context(str(torrent.get("hash", "")))
+    except Exception:
+        release = None
+    media_type = str((release or {}).get("media_type") or "")
+    if not media_type:
+        media_type = "Série" if re.search(r"S\d{1,2}E\d{1,3}", str(torrent.get("name", "")), re.I) else "Film"
+    return (_profile_for_media(media_type) or {"media_type": media_type, "found_action": "validate", "torrent_missing_action": "pause_notify"}, release)
+
+
+def _error_profile_for_torrent(torrent: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    release=None
+    try: release=wait_for_release_context(str(torrent.get("hash","")))
+    except Exception: pass
+    media_type="Série" if release and release.get("source")=="Sonarr" else "Film"
+    return (_profile_for_media(media_type) or {"media_type":media_type,"error_action":"notify_continue","error_retries":5,"error_retry_delay":30},release)
+
+
 def _review_status_from_profile(media_type: str) -> str:
     profile = _profile_for_media(media_type)
     action = (profile or {}).get("missing_action", "review")
@@ -3179,7 +3180,7 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 .section-head{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;margin:25px 0 13px}.section-head h2{margin:0}.section-head .sub{margin:5px 0 0}.activity{padding:0;overflow:hidden}.activity-row{display:grid;grid-template-columns:105px 1fr auto;gap:15px;align-items:center;padding:14px 17px;border-bottom:1px solid var(--border)}.activity-row:last-child{border-bottom:0}.activity-date{color:var(--muted);font-size:.74rem;white-space:nowrap}.activity-main{min-width:0}.activity-action{font-weight:780;font-size:.81rem}.activity-details{color:#9eabb9;font-size:.76rem;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.activity-dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--green);margin-right:8px;box-shadow:0 0 0 3px rgba(53,201,138,.08)}
 .subtabs{margin:18px 0 14px;padding:4px;width:max-content;background:var(--surface);border:1px solid var(--border);border-radius:11px}.subtab{padding:8px 12px}
 .media-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px}.media-card{background:rgba(16,23,34,.92);border:1px solid var(--border);border-radius:14px;overflow:hidden;box-shadow:var(--shadow);transition:.16s}.media-card:hover{border-color:#3a4d67;transform:translateY(-1px)}.poster{width:100%;aspect-ratio:2/3;object-fit:cover;background:#0c121a;display:block}.poster-placeholder{width:100%;aspect-ratio:2/3;display:grid;place-items:center;background:linear-gradient(145deg,#172233,#0c121a);color:#718095;font-size:2rem}.media-info{padding:12px}.media-title{font-weight:850;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.media-meta{color:var(--muted);font-size:.74rem;margin-top:5px}.media-actions{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}.media-actions a.btn{margin:0}.series-card{cursor:pointer}.series-summary{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}.mini-pill{padding:4px 7px;border-radius:999px;background:#1c2735;font-size:.68rem;font-weight:800;color:#aeb9c6}.mini-pill.y{color:var(--green)}.mini-pill.n{color:var(--red)}.mini-pill.w{color:var(--yellow)}.series-detail{display:none}.series-detail.active{display:block}.series-detail-head{display:grid;grid-template-columns:180px 1fr;gap:24px;align-items:start;margin:20px 0}.series-detail-poster{width:180px;aspect-ratio:2/3;object-fit:cover;border-radius:14px;border:1px solid var(--border);box-shadow:var(--shadow)}.series-detail-title{font-size:1.6rem;font-weight:900}.series-detail-meta{color:var(--muted);margin-top:7px}.series-detail-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}.episode-list{display:grid;gap:8px}.episode-card{display:grid;grid-template-columns:90px 1fr auto;gap:15px;align-items:center;padding:14px 16px;background:var(--surface);border:1px solid var(--border);border-radius:12px}.episode-number{font-weight:850}.episode-title{font-weight:750}.episode-status{font-size:.78rem;margin-top:4px}.episode-actions{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end}.episode-ok{color:var(--green);font-weight:800}.episode-no{color:var(--red);font-weight:800}.episode-err{color:var(--yellow);font-weight:800}.config-group{padding:13px 0;border-top:1px solid var(--border)}.config-group:first-of-type{border-top:0}.config-group h4{margin:0 0 10px;font-size:.82rem}.config-field{display:grid;grid-template-columns:125px 1fr;align-items:center;gap:12px;margin:8px 0}.config-field>span{color:var(--muted);font-size:.76rem}.config-field input{width:100%;min-width:0}.config-note{margin-top:12px;line-height:1.5}.test-btn{margin-top:8px;background:var(--surface3);border-color:var(--border)}.test-result{font-size:.76rem;margin-top:7px;min-height:1em}.test-result.ok{color:var(--green)}.test-result.bad{color:var(--red)}
-.settings-grid{display:grid;grid-template-columns:minmax(290px,.8fr) minmax(0,1.5fr);gap:18px;align-items:start}.settings-card{padding:19px}.settings-card h3{margin:0 0 6px}.settings-card .desc{color:var(--muted);font-size:.84rem;line-height:1.5;margin:0 0 16px}.setting-item{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:14px 0;border-top:1px solid var(--border)}.setting-item:first-of-type{border-top:0}.setting-copy strong{display:block;font-size:.85rem}.setting-copy span{display:block;color:var(--muted);font-size:.76rem;margin-top:4px}.switch{position:relative;width:44px;height:24px;flex:0 0 auto}.switch input{display:none}.switch span{position:absolute;inset:0;background:#2b3542;border-radius:999px;cursor:pointer;transition:.2s}.switch span:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.switch input:checked+span{background:var(--green)}.switch input:checked+span:before{transform:translateX(20px)}.savebar{display:flex;justify-content:flex-end;margin-top:17px}.profile-list{display:grid;gap:12px}.profile-card{background:rgba(21,29,39,.76);border:1px solid var(--border);border-radius:13px;padding:17px}.profile-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.profile-name{font-size:.98rem;font-weight:850}.profile-type{color:var(--muted);font-size:.76rem;margin-top:3px}.profile-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.profile-field{display:flex;flex-direction:column;gap:7px}.profile-field label{color:var(--muted);font-size:.68rem;text-transform:uppercase;font-weight:800;letter-spacing:.05em}.profile-field select{width:100%;min-width:0}.profile-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:15px;padding-top:14px;border-top:1px solid var(--border)}.status-pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;background:#202a36;font-size:.72rem;font-weight:800}.status-pill.on{color:var(--green)}.status-pill.off{color:var(--muted)}.settings-title{margin-top:0;margin-bottom:12px}.settings-title h2{margin-bottom:4px}.settings-title p{margin:0}
+.settings-grid{display:grid;grid-template-columns:minmax(290px,.8fr) minmax(0,1.5fr);gap:18px;align-items:start}.settings-card{padding:19px}.settings-card h3{margin:0 0 6px}.settings-card .desc{color:var(--muted);font-size:.84rem;line-height:1.5;margin:0 0 16px}.setting-item{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:14px 0;border-top:1px solid var(--border)}.setting-item:first-of-type{border-top:0}.setting-copy strong{display:block;font-size:.85rem}.setting-copy span{display:block;color:var(--muted);font-size:.76rem;margin-top:4px}.switch{position:relative;width:44px;height:24px;flex:0 0 auto}.switch input{display:none}.switch span{position:absolute;inset:0;background:#2b3542;border-radius:999px;cursor:pointer;transition:.2s}.switch span:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.switch input:checked+span{background:var(--green)}.switch input:checked+span:before{transform:translateX(20px)}.savebar{display:flex;justify-content:flex-end;margin-top:17px}.profile-list{display:grid;gap:12px}.profile-card{background:rgba(21,29,39,.76);border:1px solid var(--border);border-radius:13px;padding:17px}.profile-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.profile-name{font-size:.98rem;font-weight:850}.profile-type{color:var(--muted);font-size:.76rem;margin-top:3px}.profile-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.profile-field{display:flex;flex-direction:column;gap:7px}.profile-field label{color:var(--muted);font-size:.68rem;text-transform:uppercase;font-weight:800;letter-spacing:.05em}.profile-field select{width:100%;min-width:0}.profile-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:15px;padding-top:14px;border-top:1px solid var(--border)}.status-pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;background:#202a36;font-size:.72rem;font-weight:800}.status-pill.on{color:var(--green)}.status-pill.off{color:var(--muted)}.settings-title{margin-top:0;margin-bottom:12px}.settings-title h2{margin-bottom:4px}.settings-title p{margin:0}.tag-list{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.tag-chip{border:1px solid var(--border);background:#202a36;color:#e8edf2;border-radius:999px;padding:6px 10px;cursor:pointer;font-size:.75rem}.tag-chip:hover{border-color:var(--accent)}.retry-fields{grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}.retry-fields label{font-size:.68rem;color:var(--muted);text-transform:uppercase;font-weight:800}.retry-fields input{margin-top:5px}
 @media(max-width:1000px){.services{grid-template-columns:repeat(3,1fr)}.settings-grid{grid-template-columns:1fr}.profile-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:720px){main{padding:22px 15px 40px}.services{grid-template-columns:1fr 1fr}.app-header{align-items:flex-start}.tabs{overflow:auto;flex-wrap:nowrap}.tab{white-space:nowrap}.activity-row{grid-template-columns:1fr;gap:5px}.profile-grid{grid-template-columns:1fr 1fr}.profile-footer{align-items:flex-start;flex-direction:column}.savebar{justify-content:stretch}.savebar button{width:100%}.media-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){.services{grid-template-columns:1fr}.profile-grid{grid-template-columns:1fr}.version{display:none}.media-grid{grid-template-columns:1fr 1fr}}
 </style></head><body><main>
 <header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.5.6</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
@@ -3215,10 +3216,9 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 <div class="config-group"><h4>Sonarr</h4><label class="config-field"><span>Adresse</span><input id="cfgSonarrUrl"></label><label class="config-field"><span>Clé API</span><input id="cfgSonarrKey" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('sonarr')">Tester la connexion</button><div id="test-sonarr" class="test-result"></div></div>
 <div class="config-group"><h4>Discord</h4><label class="config-field"><span>Token du bot</span><input id="cfgDiscordToken" type="password" placeholder="Laisser vide pour conserver"></label><label class="config-field"><span>ID du salon</span><input id="cfgDiscordChannel"></label><label class="config-field"><span>Webhook URL</span><input id="cfgDiscordWebhook" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('discord')">Tester le bot Discord</button><div id="test-discord" class="test-result"></div></div>
 <div class="config-group"><h4>Environnement</h4><label class="config-field"><span>Fuseau horaire</span><input id="cfgTZ" placeholder="Europe/Paris"></label></div>
-<div class="config-group"><h4>Étiquettes qBittorrent ignorées</h4><p class="small">Les torrents portant l’une de ces étiquettes ne seront pas analysés par ForcedFR. Sépare les étiquettes par des virgules.</p><label class="config-field"><span>Étiquettes</span><input id="cfgQBIgnoredTags" placeholder="cross-seed, autre-etiquette"></label><div class="config-note">Exemple : <strong>cross-seed</strong>. Si qBittorrent ajoute cette étiquette au torrent, ForcedFR l’ignore automatiquement. Tu peux en saisir plusieurs, séparées par des virgules.</div></div>
 <div class="savebar"><button class="primary" onclick="saveConnectionSettings()">💾 Enregistrer les connexions</button></div><div class="small config-note">Les paramètres sont enregistrés dans SQLite. Les connexions qBittorrent / Radarr / Sonarr sont actualisées immédiatement. Un redémarrage est nécessaire après changement du token du bot Discord. Pour tester une connexion, enregistre d’abord les paramètres.</div>
 </div>
-<div><div class="settings-card"><h3>🔔 Notifications</h3><p class="desc">Choisis les événements qui doivent générer une notification.</p><div class="setting-item"><div class="setting-copy"><strong>Forced FR absent</strong><span>Notifier lorsqu'un torrent est mis en pause.</span></div><label class="switch"><input type="checkbox" id="setNoForced"><span></span></label></div><div class="setting-item"><div class="setting-copy"><strong>Erreur d'analyse</strong><span>Notifier lorsqu'une analyse FFprobe échoue.</span></div><label class="switch"><input type="checkbox" id="setErrors"><span></span></label></div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les notifications</button></div></div><div class="settings-title" style="margin-top:22px"><h2>Profils d'analyse</h2><p class="sub">Règles séparées pour les Films et les Séries.</p></div><div id="profiles" class="profile-list"></div></div>
+<div><div class="settings-card"><h3>🏷️ Étiquettes qBittorrent ignorées</h3><p class="desc">Les torrents portant l’une de ces étiquettes ne seront pas analysés par ForcedFR.</p><label class="config-field"><span>Étiquettes ignorées</span><input id="cfgQBIgnoredTags" placeholder="cross-seed, autre-etiquette"></label><div class="small" style="margin-top:10px">Étiquettes actuellement disponibles dans qBittorrent :</div><div id="qbTagsAvailable" class="tag-list"></div><div class="config-note">Clique sur une étiquette pour l’ajouter. Tu peux aussi en saisir plusieurs manuellement.</div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les étiquettes</button></div></div><div class="settings-card" style="margin-top:18px"><h3>🔔 Notifications</h3><p class="desc">Choisis les événements qui doivent générer une notification.</p><div class="setting-item"><div class="setting-copy"><strong>Forced FR absent</strong><span>Notifier lorsqu'un torrent est mis en pause.</span></div><label class="switch"><input type="checkbox" id="setNoForced"><span></span></label></div><div class="setting-item"><div class="setting-copy"><strong>Erreur d'analyse</strong><span>Notifier lorsqu'une analyse FFprobe échoue.</span></div><label class="switch"><input type="checkbox" id="setErrors"><span></span></label></div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les notifications</button></div></div><div class="settings-title" style="margin-top:22px"><h2>Profils d'analyse</h2><p class="sub">Règles séparées pour les Films et les Séries.</p></div><div id="profiles" class="profile-list"></div></div>
 </div></section>
 
 <section id="p-history" class="panel"><h2>Historique des analyses</h2><p class="sub">Historique persistant des analyses et décisions prises sur les téléchargements.</p><div class="filters"><select id="historyFilter"><option value="all">Toutes les analyses</option><option value="forced_found">Forced FR détecté</option><option value="no_forced">Pas de Forced FR</option><option value="error">Erreurs</option></select><input id="historySearch" placeholder="Rechercher un torrent…"></div>
@@ -3240,7 +3240,7 @@ async function setReviewByKey(encodedKey,status){const key=decodeURIComponent(en
 document.addEventListener('click',e=>{const b=e.target.closest('.review-btn');if(b){setReviewByKey(b.dataset.reviewKey,b.dataset.reviewStatus);return}const card=e.target.closest('.series-card');if(card&&!e.target.closest('a,button'))openSeries(card.dataset.seriesKey)});
 function poster(i){return i.poster_url?'<img class="poster" loading="lazy" src="'+esc(i.poster_url)+'" alt="">':'<div class="poster-placeholder">'+(i.type==='Film'?'🎬':'📺')+'</div>'}
 function filmCard(i){return '<article class="media-card"><a target="_blank" href="'+esc(i.arr_url||'#')+'" style="display:block">'+poster(i)+'</a><div class="media-info"><div class="media-title" title="'+esc(i.title)+'">'+esc(i.title)+'</div><div class="media-meta">'+badge(i)+'</div>'+reviewBadge(i)+(i.error?'<div class="small" style="margin-top:6px">'+esc(i.error)+'</div>':'')+'<div class="media-actions">'+mediaActions(i)+'</div></div></article>'}
-function seriesCard(title,items){const first=items[0]||{};const yes=items.filter(i=>i.status!=='error'&&i.forced_french).length,no=items.filter(i=>i.status!=='error'&&!i.forced_french).length,err=items.filter(i=>i.status==='error').length;const needs=items.some(i=>i.status==='error'||(!i.forced_french&&(i.review_status||'pending')==='pending'));const q=($('ss')?.value||'').toLowerCase();if(q&&!title.toLowerCase().includes(q))return '';const sonarr=first.arr_url?'<a class="btn" target="_blank" href="'+esc(first.arr_url)+'">Ouvrir Sonarr</a>':'';const action=needs?'<button class="review-btn" onclick="openSeries('+JSON.stringify(title)+')">⚠ Action nécessaire</button>':'';return '<article class="media-card series-card" data-series-key="'+esc(title)+'"><div>'+poster(first)+'</div><div class="media-info"><div class="media-title" title="'+esc(title)+'">'+esc(title)+'</div><div class="media-meta">'+items.length+' épisode(s)</div><div class="series-summary"><span class="mini-pill y">'+yes+' avec FR</span><span class="mini-pill n">'+no+' sans FR</span>'+(err?'<span class="mini-pill w">'+err+' erreur(s)</span>':'')+'</div><div class="media-actions">'+sonarr+action+'</div></div></article>'}
+function seriesCard(title,items){const first=items[0]||{};const yes=items.filter(i=>i.status!=='error'&&i.forced_french).length,no=items.filter(i=>i.status!=='error'&&!i.forced_french).length,err=items.filter(i=>i.status==='error').length;const needs=items.some(i=>i.status==='error'||(!i.forced_french&&(i.review_status||'pending')==='pending'));const q=($('ss')?.value||'').toLowerCase();if(q&&!title.toLowerCase().includes(q))return '';const sonarr=first.arr_url?'<a class="btn" target="_blank" href="'+esc(first.arr_url)+'">Ouvrir Sonarr</a>':'';const actionInfo=needs?'<span class="series-attention">⚠ '+items.filter(i=>i.status==='error'||(!i.forced_french&&(i.review_status||'pending')==='pending')).length+' à traiter</span>':'';return '<article class="media-card series-card" data-series-key="'+esc(title)+'"><div>'+poster(first)+'</div><div class="media-info"><div class="media-title" title="'+esc(title)+'">'+esc(title)+'</div><div class="media-meta">'+items.length+' épisode(s)</div><div class="series-summary"><span class="mini-pill y">'+yes+' avec FR</span><span class="mini-pill n">'+no+' sans FR</span>'+(err?'<span class="mini-pill w">'+err+' erreur(s)</span>':'')+'</div><div class="media-actions">'+sonarr+action+'</div></div></article>'}
 function openSeries(title){const items=data.filter(i=>i.type==='Série'&&i.title===title).slice().sort((a,b)=>(a.season_number||0)-(b.season_number||0)||(a.episode_number||0)-(b.episode_number||0));if(!items.length)return;const first=items[0],panel=$('seriesDetail');const episodes=items.map(i=>{const status=i.status==='error'?'<span class="episode-err">⚠ Erreur</span>':i.forced_french?'<span class="episode-ok">✅ Forced FR</span>':'<span class="episode-no">❌ Sans Forced FR</span>';const actions=[];if(i.arr_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir Sonarr</a>');if(i.status!=='error'&&!i.forced_french&&i.media_key){const key=encodeURIComponent(i.media_key),rs=i.review_status||'pending';if(rs==='pending'){actions.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="validated">✓ C’est normal</button>');actions.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="waiting_replacement">⏳ Attendre</button>')}else actions.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="pending">↩ À traiter</button>')}return '<div class="episode-card"><div class="episode-number">'+esc(i.season||'—')+' · '+esc(i.episode||'—')+'</div><div><div class="episode-title">'+esc(i.episode_title||i.episode_name||'Épisode')+'</div><div class="episode-status">'+status+(i.error?' — '+esc(i.error):'')+'</div></div><div class="episode-actions">'+actions.join('')+'</div></div>'}).join('');panel.innerHTML='<button class="btn" onclick="closeSeries()">← Retour aux séries</button><div class="series-detail-head"><div>'+poster(first).replace('class="poster"','class="series-detail-poster"')+'</div><div><div class="series-detail-title">'+esc(title)+'</div><div class="series-detail-meta">'+items.length+' épisode(s) · '+items.filter(i=>i.forced_french).length+' avec Forced FR · '+items.filter(i=>i.status!=='error'&&!i.forced_french).length+' sans Forced FR'+(items.filter(i=>i.status==='error').length?' · '+items.filter(i=>i.status==='error').length+' erreur(s)':'')+'</div><div class="series-detail-actions">'+(first.arr_url?'<a class="btn" target="_blank" href="'+esc(first.arr_url)+'">Ouvrir Sonarr</a>':'')+'</div></div></div><div class="episode-list">'+episodes+'</div>';$('seriesGrid').style.display='none';panel.classList.add('active')}
 function closeSeries(){$('seriesDetail').classList.remove('active');$('seriesGrid').style.display='grid'}
 function render(kind){const r=rows(kind),target=$(kind);if(kind==='films'){target.innerHTML=r.length?r.map(filmCard).join(''):'<div class="empty">Aucun film correspondant.</div>';return}const groups={};r.forEach(i=>(groups[i.title]??=[]).push(i));const html=Object.entries(groups).sort((a,b)=>a[0].localeCompare(b[0],'fr')).map(([title,items])=>seriesCard(title,items)).join('');target.innerHTML=html||'<div class="empty">Aucune série correspondante.</div>'}
@@ -3255,9 +3255,13 @@ function renderHistory(){const q=($('historySearch')?.value||'').toLowerCase(),f
 async function loadDashboard(){const d=await api('/dashboard/stats');const l=d.library,t=d.torrents;const cards=[['Bibliothèque',l.total,'médias'],['Avec Forced FR',l.forced,'validés'],['Sans Forced FR',l.no_forced,'médias'],['🔴 À traiter',l.pending,'médias'],['🟠 En attente',l.waiting,'médias'],['🟢 Absence normale',l.validated,'médias'],['⚠ Erreurs',l.errors,'à traiter'],['Torrents analysés',t.total,'analyses']];$('dashCards').innerHTML=cards.map(c=>'<div class="card"><div class="label">'+c[0]+'</div><div class="value" style="font-size:1.5rem">'+c[1]+'</div><div class="small">'+c[2]+'</div></div>').join('');$('recent').innerHTML=d.recent.length?d.recent.map(i=>{const name=i.torrent_name||'Torrent';const texts={analysis:i.result==='forced_found'?'Analyse terminée : Forced FR détecté':i.result==='no_forced'?'Analyse terminée : aucun Forced FR':'Analyse terminée',auto_pause:'Téléchargement mis en pause automatiquement',pause:'Téléchargement maintenu en pause',resume:'Téléchargement repris'};const label=texts[i.action]||'Action effectuée';return '<div class="activity-row"><div class="activity-date">'+new Date(i.created_at*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</div><div class="activity-main"><div class="activity-action"><span class="activity-dot"></span>'+esc(label)+'</div><div class="activity-details">'+esc(name)+(i.details?' — '+esc(i.details):'')+'</div></div><div>'+ (i.result==='forced_found'?'<span class="badge yes">OK</span>':i.result==='no_forced'?'<span class="badge no">À traiter</span>':'<span class="badge err">Info</span>') +'</div></div>'}).join(''):'<div class="activity-empty">Aucune activité enregistrée pour le moment.</div>'}
 async function loadErrors(){const d=await api('/errors');$('errors').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.last_seen*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td><strong>'+esc(i.title||'—')+'</strong><div class="small">'+esc(i.media_type)+' · '+esc(i.path||'')+'</div></td><td>'+esc(i.error)+'</td><td><button class="review-btn" onclick="resolveError('+i.id+')">✓ Marquer traité</button></td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune erreur à traiter.</td></tr>'}
 async function resolveError(id){try{await api('/errors/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadErrors();loadDashboard()}catch(e){alert(e.message)}}
-async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value='';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value='';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value='';$('cfgDiscordToken').value='';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value='';$('cfgTZ').value=c.values.TZ||'';$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';$('profiles').innerHTML=p.results.map(i=>'<div class="profile-card"><div class="profile-top"><div><div class="profile-name">'+esc(i.media_type==='Film'?'Films':'Séries')+'</div><div class="profile-type">Règles de contrôle de la bibliothèque</div></div><span class="status-pill '+(i.enabled?'on':'off')+'">'+(i.enabled?'● Actif':'○ Inactif')+'</span></div><div class="profile-grid"><div class="profile-field"><label>Forced FR</label><div class="small">'+(i.forced_required?'Obligatoire':'Non obligatoire')+'</div></div><div class="profile-field"><label>Si absent</label><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div><div class="profile-field"><label>Si erreur</label><div class="small">Continuer + notifier</div></div></div><div class="profile-footer"><label class="setting-item" style="padding:0;border:0;justify-content:flex-start"><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+' style="min-width:0;flex:none"><span>Profil actif</span></label><button class="primary" onclick="saveProfile('+JSON.stringify(i.name)+','+JSON.stringify(i.media_type)+','+(i.forced_required?'true':'false')+')">💾 Enregistrer</button></div></div>').join('')}
-async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,error_action:'notify_continue',enabled:$('ena-'+name).checked})});alert('Profil enregistré. Les nouveaux médias analysés utiliseront ce réglage.')}catch(e){alert(e.message)}}
+async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value='';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value='';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value='';$('cfgDiscordToken').value='';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value='';$('cfgTZ').value=c.values.TZ||'';$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';loadQbTags();$('profiles').innerHTML=p.results.map(i=>'<div class="profile-card"><div class="profile-top"><div><div class="profile-name">'+esc(i.media_type==='Film'?'🎬 Films':'📺 Séries')+'</div><div class="profile-type">Règles appliquées aux analyses de ce type de média</div></div><span class="status-pill '+(i.enabled?'on':'off')+'">'+(i.enabled?'● Actif':'○ Inactif')+'</span></div><div class="profile-grid"><div class="profile-field"><label>Si Forced FR trouvé</label><select id="found-'+esc(i.name)+'"><option value="validate" '+(i.found_action==='validate'?'selected':'')+'>✓ Valider</option><option value="pause_notify" '+(i.found_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="validate_notify" '+(i.found_action==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option></select></div><div class="profile-field"><label>Si Forced FR absent</label><select id="tm-'+esc(i.name)+'"><option value="pause_notify" '+(i.torrent_missing_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="continue_notify" '+(i.torrent_missing_action==='continue_notify'?'selected':'')+'>▶ Continuer + notifier Discord</option><option value="pause_decision" '+(i.torrent_missing_action==='pause_decision'?'selected':'')+'>❓ Mettre en pause et demander une décision</option></select></div><div class="profile-field"><label>Après scan bibliothèque</label><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div><div class="profile-field"><label>Si erreur d’analyse</label><select id="err-'+esc(i.name)+'" onchange="toggleRetryFields('+JSON.stringify(i.name)+')"><option value="notify_continue" '+(i.error_action==='notify_continue'?'selected':'')+'>▶ Continuer + notifier</option><option value="pause_decision" '+(i.error_action==='pause_decision'?'selected':'')+'>⏸ Pause + demander une décision</option><option value="retry_pause" '+(i.error_action==='retry_pause'?'selected':'')+'>🔄 Réessayer puis mettre en pause</option><option value="retry_continue" '+(i.error_action==='retry_continue'?'selected':'')+'>🔄 Réessayer puis continuer</option></select><div class="retry-fields" id="retry-'+esc(i.name)+'" style="display:'+(i.error_action==='retry_pause'||i.error_action==='retry_continue'?'grid':'none')+'"><label>Nombre de tentatives<input type="number" min="1" max="20" id="retries-'+esc(i.name)+'" value="'+(i.error_retries||5)+'"></label><label>Délai entre tentatives (s)<input type="number" min="1" max="3600" id="delay-'+esc(i.name)+'" value="'+(i.error_retry_delay||30)+'"></label></div></div></div><div class="profile-footer"><label class="setting-item" style="padding:0;border:0;justify-content:flex-start"><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+' style="min-width:0;flex:none"><span>Profil actif</span></label><button class="primary" onclick="saveProfile('+JSON.stringify(i.name)+','+JSON.stringify(i.media_type)+','+(i.forced_required?'true':'false')+')">💾 Enregistrer</button></div></div>').join('')}
+function toggleRetryFields(name){const v=$('err-'+name).value;const box=$('retry-'+name);if(box)box.style.display=(v==='retry_pause'||v==='retry_continue')?'grid':'none'}
+async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,found_action:$('found-'+name).value,torrent_missing_action:$('tm-'+name).value,error_action:$('err-'+name).value,error_retries:parseInt($('retries-'+name)?.value||5,10),error_retry_delay:parseFloat($('delay-'+name)?.value||30),enabled:$('ena-'+name).checked})});alert('Profil enregistré.')}catch(e){alert(e.message)}}
 async function testConnection(kind){const el=$('test-'+kind);el.className='test-result warn';el.textContent='Test en cours…';try{const d=await api('/test/'+kind,{method:'POST'});el.className='test-result '+(d.ok?'ok':'bad');el.textContent=(d.ok?'✓ ':'✕ ')+d.message}catch(e){el.className='test-result bad';el.textContent='✕ '+e.message}}
+async function loadQbTags(){try{const d=await api('/qbittorrent/tags');const box=$('qbTagsAvailable');if(!box)return;box.innerHTML=d.results.length?d.results.map(t=>'<button type="button" class="tag-chip" onclick="addIgnoredTag('+JSON.stringify(t)+')">'+esc(t)+'</button>').join(''):'<span class="small">Aucune étiquette trouvée dans qBittorrent.</span>'}catch(e){const box=$('qbTagsAvailable');if(box)box.innerHTML='<span class="small warn">Impossible de récupérer les étiquettes qBittorrent.</span>'}}
+function addIgnoredTag(tag){const input=$('cfgQBIgnoredTags');const current=input.value.split(',').map(x=>x.trim()).filter(Boolean);if(!current.some(x=>x.toLowerCase()===tag.toLowerCase()))current.push(tag);input.value=current.join(', ')}
+
 async function saveConnectionSettings(){try{const payload={QB_HOST:$('cfgQBHost').value,QB_USERNAME:$('cfgQBUsername').value,QB_PASSWORD:$('cfgQBPassword').value,RADARR_URL:$('cfgRadarrUrl').value,RADARR_API_KEY:$('cfgRadarrKey').value,SONARR_URL:$('cfgSonarrUrl').value,SONARR_API_KEY:$('cfgSonarrKey').value,DISCORD_BOT_TOKEN:$('cfgDiscordToken').value,DISCORD_CHANNEL_ID:$('cfgDiscordChannel').value,DISCORD_WEBHOOK_URL:$('cfgDiscordWebhook').value,TZ:$('cfgTZ').value};await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Connexions enregistrées.');refresh()}catch(e){alert(e.message)}}
 async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked,qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
 $('historyFilter').onchange=renderHistory;$('historySearch').oninput=renderHistory;
@@ -3273,7 +3277,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.5.6",
+        "version": "2.5.7",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -3397,6 +3401,11 @@ def update_configuration(payload: dict[str, Any]) -> dict[str, Any]:
     load_runtime_configuration()
     return configuration()
 
+@app.get("/qbittorrent/tags")
+def qbittorrent_tags() -> dict[str, Any]:
+    return {"results": get_qbittorrent_tags()}
+
+
 @app.get("/settings")
 def settings() -> dict[str, Any]:
     return {
@@ -3435,10 +3444,10 @@ def update_profile(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Type de média invalide.")
     with _db_connect() as conn:
         conn.execute("""
-            INSERT INTO forcedfr_profiles(name,media_type,forced_required,missing_action,error_action,enabled,updated_at)
-            VALUES (?,?,?,?,?,?,?)
-            ON CONFLICT(name) DO UPDATE SET media_type=excluded.media_type,forced_required=excluded.forced_required,missing_action=excluded.missing_action,error_action=excluded.error_action,enabled=excluded.enabled,updated_at=excluded.updated_at
-        """, (name, media_type, int(bool(payload.get("forced_required", True))), str(payload.get("missing_action") or "review"), str(payload.get("error_action") or "notify_continue"), int(bool(payload.get("enabled", True))), time.time()))
+            INSERT INTO forcedfr_profiles(name,media_type,forced_required,missing_action,error_action,enabled,updated_at,error_retries,error_retry_delay,found_action,torrent_missing_action)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(name) DO UPDATE SET media_type=excluded.media_type,forced_required=excluded.forced_required,missing_action=excluded.missing_action,error_action=excluded.error_action,enabled=excluded.enabled,updated_at=excluded.updated_at,error_retries=excluded.error_retries,error_retry_delay=excluded.error_retry_delay,found_action=excluded.found_action,torrent_missing_action=excluded.torrent_missing_action
+        """, (name,media_type,int(bool(payload.get("forced_required",True))),str(payload.get("missing_action") or "review"),str(payload.get("error_action") or "notify_continue"),int(bool(payload.get("enabled",True))),time.time(),max(1,min(20,int(payload.get("error_retries") or 5))),max(1.0,min(3600.0,float(payload.get("error_retry_delay") or 30))),str(payload.get("found_action") or "validate"),str(payload.get("torrent_missing_action") or "pause_notify")))
     return {"ok": True}
 
 
