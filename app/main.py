@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from urllib.parse import quote_plus
 from fastapi import FastAPI, HTTPException
 
 from fastapi.responses import HTMLResponse
@@ -75,6 +76,14 @@ STARTUP_STABLE_CHECKS_REQUIRED = 3
 # Base SQLite persistante pour les analyses de bibliothèque.
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/app/data/forcedfr.db")
 
+# IA v2.6 : Google AI Studio / Gemini + Brave Search API.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
+BRAVE_RESULTS_COUNT = int(os.getenv("BRAVE_RESULTS_COUNT", "5"))
+AI_ENABLED = os.getenv("AI_ENABLED", "1") == "1"
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "1") == "1"
+
 
 # ============================================================
 # LOGGING
@@ -95,7 +104,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.5.14",
+    version="2.6.0",
 )
 
 
@@ -1519,6 +1528,190 @@ def analyze_with_temporary_priority(
 
 
 # ============================================================
+# IA v2.6 — BRAVE SEARCH + GEMINI
+# ============================================================
+
+def _ai_cache_key(title: str, year: str | None, media_type: str, item_id: Any = None, source: str | None = None) -> str:
+    # Si Radarr/Sonarr fournit un identifiant média, il prime sur le nom de release
+    # afin que plusieurs releases du même film réutilisent la même recherche IA.
+    raw = (f"{media_type}|{source or ''}|id:{item_id}" if item_id else f"{media_type}|title:{title.strip().casefold()}|{year or ''}")
+    import hashlib
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _extract_year(text: str) -> str | None:
+    m = re.search(r"\b(19|20)\d{2}\b", text or "")
+    return m.group(0) if m else None
+
+
+def brave_web_search(query: str, count: int | None = None) -> list[dict[str, Any]]:
+    if not BRAVE_SEARCH_API_KEY:
+        raise RuntimeError("Clé API Brave Search non configurée.")
+    if not WEB_SEARCH_ENABLED:
+        raise RuntimeError("La recherche Web est désactivée dans ForcedFR.")
+    response = requests.get(
+        "https://api.search.brave.com/res/v1/web/search",
+        headers={
+            "Accept": "application/json",
+            "Accept-Encoding": "gzip",
+            "X-Subscription-Token": BRAVE_SEARCH_API_KEY,
+        },
+        params={
+            "q": query,
+            "count": max(1, min(10, int(count or BRAVE_RESULTS_COUNT))),
+            "country": "FR",
+            "search_lang": "fr",
+            "ui_lang": "fr-FR",
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+    results = []
+    for item in ((data.get("web") or {}).get("results") or []):
+        results.append({
+            "title": str(item.get("title") or ""),
+            "url": str(item.get("url") or ""),
+            "description": str(item.get("description") or ""),
+        })
+    return results
+
+
+def _gemini_generate_json(prompt: str) -> dict[str, Any]:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Clé API Gemini non configurée.")
+    if not AI_ENABLED:
+        raise RuntimeError("L'analyse IA est désactivée dans ForcedFR.")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{quote_plus(GEMINI_MODEL)}:generateContent"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+        },
+    }
+    response = requests.post(url, params={"key": GEMINI_API_KEY}, json=payload, timeout=60)
+    response.raise_for_status()
+    data = response.json()
+    text = ""
+    for candidate in data.get("candidates", []):
+        for part in (candidate.get("content", {}) or {}).get("parts", []):
+            if part.get("text"):
+                text += str(part["text"])
+    if not text:
+        raise RuntimeError("Gemini n'a renvoyé aucune réponse exploitable.")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Réponse Gemini non JSON : {text[:500]}") from exc
+
+
+def _ai_cache_get(cache_key: str) -> dict[str, Any] | None:
+    with _db_connect() as conn:
+        row = conn.execute("SELECT * FROM ai_research_cache WHERE cache_key=?", (cache_key,)).fetchone()
+    if not row:
+        return None
+    data = dict(row)
+    try: data["sources"] = json.loads(data.get("sources") or "[]")
+    except Exception: data["sources"] = []
+    try: data["brave_queries"] = json.loads(data.get("brave_queries") or "[]")
+    except Exception: data["brave_queries"] = []
+    return data
+
+
+def _ai_cache_put(cache_key: str, media_type: str, title: str, year: str | None, result: dict[str, Any], queries: list[str]) -> None:
+    with _db_connect() as conn:
+        conn.execute("""
+            INSERT INTO ai_research_cache(cache_key,media_type,title,year,result,confidence,justification,sources,model,researched_at,brave_queries)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(cache_key) DO UPDATE SET result=excluded.result,confidence=excluded.confidence,justification=excluded.justification,sources=excluded.sources,model=excluded.model,researched_at=excluded.researched_at,brave_queries=excluded.brave_queries
+        """, (
+            cache_key, media_type, title, year,
+            str(result.get("result") or "INDETERMINE"),
+            float(result.get("confidence") or 0),
+            str(result.get("justification") or ""),
+            json.dumps(result.get("sources") or [], ensure_ascii=False),
+            GEMINI_MODEL, time.time(), json.dumps(queries, ensure_ascii=False),
+        ))
+
+
+def research_forced_fr_with_ai(torrent: dict[str, Any], release: dict[str, Any] | None, media_type: str) -> dict[str, Any]:
+    title = str((release or {}).get("title") or torrent.get("name") or "").strip()
+    year = _extract_year(title)
+    item_id = (release or {}).get("item_id")
+    cache_key = _ai_cache_key(title, year, media_type, item_id, (release or {}).get("source"))
+    cached = _ai_cache_get(cache_key)
+    if cached:
+        cached["cached"] = True
+        return cached
+
+    if not title:
+        raise RuntimeError("Impossible d'identifier le film ou la série pour la recherche IA.")
+
+    year_part = f" {year}" if year else ""
+    queries = [
+        f'"{title}"{year_part} French forced subtitles',
+        f'"{title}"{year_part} "forced subtitles" French Blu-ray',
+        f'"{title}"{year_part} dialogue langue étrangère sous-titres français',
+    ]
+    all_results: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    for query in queries:
+        for item in brave_web_search(query):
+            url = item.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_results.append(item)
+
+    source_block = "\n\n".join(
+        f"SOURCE {i}:\nTitre: {r['title']}\nURL: {r['url']}\nExtrait: {r['description']}"
+        for i, r in enumerate(all_results[:15], 1)
+    )
+    prompt = f"""Tu es l'analyste ForcedFR. Détermine si une piste de sous-titres français FORCED est normalement nécessaire pour la version française de ce média.\n\nMédia: {title}\nAnnée: {year or 'inconnue'}\nType: {media_type}\n\nTu dois te baser sur les informations trouvées sur le Web ci-dessous. Ne déduis jamais qu'un film français n'a pas besoin de Forced FR simplement parce qu'il est français : recherche notamment les dialogues en langue étrangère, les versions françaises et les sorties Blu-ray/DVD.\n\nRéponds UNIQUEMENT en JSON avec exactement ces champs:\nresult: NÉCESSAIRE | NON_NÉCESSAIRE | INDETERMINÉ\nconfidence: nombre entre 0 et 1\njustification: explication courte en français\nsources: tableau d'objets {{title,url}} contenant uniquement les sources réellement utiles\n\nSOURCES WEB:\n{source_block}\n"""
+    result = _gemini_generate_json(prompt)
+    normalized = str(result.get("result") or "INDETERMINÉ").strip().upper().replace("É", "E")
+    mapping = {"NECESSAIRE":"NÉCESSAIRE", "NON_NECESSAIRE":"NON_NÉCESSAIRE", "INDETERMINE":"INDETERMINÉ"}
+    result["result"] = mapping.get(normalized, "INDETERMINÉ")
+    result["confidence"] = max(0.0, min(1.0, float(result.get("confidence") or 0)))
+    result["sources"] = result.get("sources") or []
+    _ai_cache_put(cache_key, media_type, title, year, result, queries)
+    result["cached"] = False
+    return result
+
+
+def _apply_ai_recommendation(torrent: dict[str, Any], release: dict[str, Any] | None, profile: dict[str, Any], recommendation: dict[str, Any]) -> str:
+    result = str(recommendation.get("result") or "INDETERMINÉ")
+    action_key = {
+        "NÉCESSAIRE": "ai_needed_action",
+        "NON_NÉCESSAIRE": "ai_not_needed_action",
+        "INDETERMINÉ": "ai_unknown_action",
+    }.get(result, "ai_unknown_action")
+    action = str(profile.get(action_key) or ("pause_notify" if result == "NÉCESSAIRE" else "continue" if result == "NON_NÉCESSAIRE" else "pause_decision"))
+    name = str(torrent.get("name") or "Torrent")
+    confidence = float(recommendation.get("confidence") or 0) * 100
+    label = f"{result} ({confidence:.0f} %)"
+    justification = str(recommendation.get("justification") or "Aucune justification fournie.")
+    details = f"Gemini : {label} — {justification}"
+    if action in {"continue", "continue_notify"}:
+        start_torrent(str(torrent.get("hash", "")))
+        text = f"▶️ Téléchargement poursuivi. Recommandation Gemini : **{label}**."
+        record_torrent_action(str(torrent.get("hash", "")), "resume", source="gemini", details=details)
+    elif action in {"pause_notify", "leave_pause"}:
+        text = f"⏸️ Torrent laissé en pause. Recommandation Gemini : **{label}**."
+        record_torrent_action(str(torrent.get("hash", "")), "auto_pause", source="gemini", details=details)
+    elif action == "pause_decision":
+        text = f"⏸️ Torrent laissé en pause. Décision demandée. Recommandation Gemini : **{label}**."
+        record_torrent_action(str(torrent.get("hash", "")), "auto_pause", source="gemini", details=details)
+    else:
+        start_torrent(str(torrent.get("hash", "")))
+        text = f"▶️ Téléchargement poursuivi. Recommandation Gemini : **{label}**."
+        record_torrent_action(str(torrent.get("hash", "")), "resume", source="gemini", details=details)
+    if action in {"continue_notify", "pause_notify", "pause_decision", "leave_pause"}:
+        notify_profile_decision(torrent, f"🤖 Gemini : {result}", f"Gemini a analysé les sources Web pour **{name}**.\n\n**Conclusion :** {label}\n**Justification :** {justification}", text, release)
+    return text
+
+
+# ============================================================
 # TRAITEMENT NOUVEAU TORRENT
 # ============================================================
 
@@ -1565,6 +1758,11 @@ def process_new_torrent(
                 ignored_tag,
             )
             return
+
+        # Le torrent reste en pause pendant toute l'analyse FFprobe / IA.
+        if torrent.get("state") not in {"pausedDL", "pausedUP", "stoppedDL", "stoppedUP", "checkingUP", "checkingDL"}:
+            stop_torrent(torrent_hash)
+            log.info("[%s] ⏸️ Torrent mis en pause pour analyse.", torrent_hash)
 
         if not torrent.get(
             "f_l_piece_prio",
@@ -1656,14 +1854,15 @@ def process_new_torrent(
                     found_action = str(profile.get("found_action") or "validate")
                     name = str(torrent.get("name", ""))
                     if found_action == "pause_notify":
-                        stop_torrent(torrent_hash)
-                        action_text = "⏸️ Torrent mis en pause. Forced FR détecté."
+                        action_text = "⏸️ Torrent laissé en pause. Forced FR détecté."
                         record_torrent_action(torrent_hash, "auto_pause", source="forcedfr", details="Pause après détection d'une piste FR Forced.")
                         notify_profile_decision(torrent, "🇫🇷 Forced FR détecté", f"Une piste française Forced a été détectée dans **{name}**.", action_text, release)
                     elif found_action == "validate_notify":
+                        start_torrent(torrent_hash)
                         action_text = "🔔 Torrent validé et notification envoyée. Le téléchargement poursuit son cours."
                         notify_profile_decision(torrent, "🇫🇷 Forced FR détecté", f"Une piste française Forced a été détectée dans **{name}**.", action_text, release)
                     else:
+                        start_torrent(torrent_hash)
                         action_text = "✓️ Torrent validé. Le téléchargement poursuit son cours."
                     record_analysis_history(torrent_hash, name, "forced_found", action_text)
                     return
@@ -1679,20 +1878,34 @@ def process_new_torrent(
                 )
 
                 profile, release = _torrent_profile_for_torrent(torrent)
-                missing_action = str(profile.get("torrent_missing_action") or "pause_notify")
                 name = str(torrent.get("name", ""))
+                media_type = str(profile.get("media_type") or ("Série" if re.search(r"S\d{1,2}E\d{1,3}", name, re.I) else "Film"))
+                if _setting_bool("ai_enabled", True) and AI_ENABLED and GEMINI_API_KEY and _setting_bool("web_search_enabled", True) and BRAVE_SEARCH_API_KEY:
+                    try:
+                        recommendation = research_forced_fr_with_ai(torrent, release, media_type)
+                        action_text = _apply_ai_recommendation(torrent, release, profile, recommendation)
+                        record_analysis_history(torrent_hash, name, "no_forced", action_text)
+                        return
+                    except Exception as exc:
+                        error_text = f"Recherche IA/Web impossible : {exc}"
+                        log.exception("[%s] %s", torrent_hash, error_text)
+                        record_analysis_history(torrent_hash, name, "error", error_text)
+                        if apply_analysis_error_policy(torrent, error_text, real_error_count + 1):
+                            real_error_count += 1
+                            continue
+                        return
+
+                missing_action = str(profile.get("torrent_missing_action") or "pause_notify")
                 if missing_action == "continue_notify":
                     start_torrent(torrent_hash)
                     action_text = "▶️ Téléchargement poursuivi. Aucune piste FR Forced détectée."
                     record_torrent_action(torrent_hash, "resume", source="forcedfr", details="Téléchargement poursuivi après analyse sans piste FR Forced.")
                 elif missing_action == "pause_decision":
-                    stop_torrent(torrent_hash)
-                    action_text = "⏸️ Torrent mis en pause. Une décision est demandée dans Discord."
-                    record_torrent_action(torrent_hash, "auto_pause", source="forcedfr", details="Torrent mis en pause en attente d'une décision Discord.")
+                    action_text = "⏸️ Torrent laissé en pause. Une décision est demandée dans Discord."
+                    record_torrent_action(torrent_hash, "auto_pause", source="forcedfr", details="Torrent laissé en pause en attente d'une décision Discord.")
                 else:
-                    stop_torrent(torrent_hash)
-                    action_text = "⏸️ Torrent mis en pause. Aucune piste FR Forced détectée."
-                    record_torrent_action(torrent_hash, "auto_pause", source="forcedfr", details="Torrent mis en pause après analyse sans piste FR Forced.")
+                    action_text = "⏸️ Torrent laissé en pause. Aucune piste FR Forced détectée."
+                    record_torrent_action(torrent_hash, "auto_pause", source="forcedfr", details="Torrent laissé en pause après analyse sans piste FR Forced.")
                 notify_profile_decision(torrent, "🚨 Aucun Forced FR détecté", f"Aucune piste française Forced n'a été trouvée dans **{name}**.", action_text, release)
                 record_analysis_history(torrent_hash, name, "no_forced", action_text)
                 return
@@ -2056,7 +2269,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.5.14",
+        "version": "2.6.0",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -2322,6 +2535,23 @@ def init_database() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_torrent_actions_created_at ON torrent_actions(created_at DESC)")
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS ai_research_cache (
+                cache_key TEXT PRIMARY KEY,
+                media_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                year TEXT,
+                result TEXT NOT NULL,
+                confidence REAL,
+                justification TEXT,
+                sources TEXT NOT NULL DEFAULT '[]',
+                model TEXT,
+                researched_at REAL NOT NULL,
+                brave_queries TEXT NOT NULL DEFAULT '[]'
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_ai_research_title ON ai_research_cache(title)")
+
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS library_errors (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 media_key TEXT UNIQUE NOT NULL,
@@ -2350,6 +2580,8 @@ def init_database() -> None:
             "library_profile_films": "strict",
             "library_profile_series": "strict",
             "qb_ignored_tags": "",
+            "ai_enabled": "1",
+            "web_search_enabled": "1",
         }
         for key, value in defaults.items():
             conn.execute(
@@ -2382,6 +2614,12 @@ def init_database() -> None:
             conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN found_action TEXT NOT NULL DEFAULT 'validate'")
         if "torrent_missing_action" not in cols:
             conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN torrent_missing_action TEXT NOT NULL DEFAULT 'pause_notify'")
+        if "ai_needed_action" not in cols:
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN ai_needed_action TEXT NOT NULL DEFAULT 'pause_notify'")
+        if "ai_not_needed_action" not in cols:
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN ai_not_needed_action TEXT NOT NULL DEFAULT 'continue'")
+        if "ai_unknown_action" not in cols:
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN ai_unknown_action TEXT NOT NULL DEFAULT 'pause_decision'")
     log.info("SQLite initialisée : %s", SQLITE_PATH)
 
 
@@ -2553,11 +2791,15 @@ CONFIG_FALLBACKS = {
     "RADARR_API_KEY": RADARR_API_KEY, "RADARR_URL": RADARR_URL,
     "SONARR_API_KEY": SONARR_API_KEY, "SONARR_URL": SONARR_URL,
     "TZ": os.getenv("TZ", "Europe/Paris"),
+    "GEMINI_API_KEY": GEMINI_API_KEY, "GEMINI_MODEL": GEMINI_MODEL,
+    "BRAVE_SEARCH_API_KEY": BRAVE_SEARCH_API_KEY,
+    "BRAVE_RESULTS_COUNT": str(BRAVE_RESULTS_COUNT),
 }
 
 def load_runtime_configuration() -> None:
     global DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_WEBHOOK_URL
     global QB_HOST, QB_PASSWORD, QB_USERNAME, RADARR_API_KEY, RADARR_URL, SONARR_API_KEY, SONARR_URL
+    global GEMINI_API_KEY, GEMINI_MODEL, BRAVE_SEARCH_API_KEY, BRAVE_RESULTS_COUNT
     for key, fallback in CONFIG_FALLBACKS.items():
         value = _setting("config_" + key, fallback)
         if key == "DISCORD_BOT_TOKEN": DISCORD_BOT_TOKEN = value
@@ -2573,6 +2815,12 @@ def load_runtime_configuration() -> None:
         elif key == "TZ" and value:
             os.environ["TZ"] = value
             if hasattr(time, "tzset"): time.tzset()
+        elif key == "GEMINI_API_KEY": GEMINI_API_KEY = value
+        elif key == "GEMINI_MODEL": GEMINI_MODEL = value or "gemini-3.8-flash"
+        elif key == "BRAVE_SEARCH_API_KEY": BRAVE_SEARCH_API_KEY = value
+        elif key == "BRAVE_RESULTS_COUNT":
+            try: BRAVE_RESULTS_COUNT = max(1, min(10, int(value or 5)))
+            except ValueError: BRAVE_RESULTS_COUNT = 5
 
 load_runtime_configuration()
 
@@ -3171,7 +3419,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.5.14</title>
+<title>ForcedFR v2.6.0</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -3187,7 +3435,7 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 .settings-grid{display:grid;grid-template-columns:minmax(290px,.8fr) minmax(0,1.5fr);gap:18px;align-items:start}.settings-card{padding:19px}.settings-card h3{margin:0 0 6px}.settings-card .desc{color:var(--muted);font-size:.84rem;line-height:1.5;margin:0 0 16px}.setting-item{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:14px 0;border-top:1px solid var(--border)}.setting-item:first-of-type{border-top:0}.setting-copy strong{display:block;font-size:.85rem}.setting-copy span{display:block;color:var(--muted);font-size:.76rem;margin-top:4px}.switch{position:relative;width:44px;height:24px;flex:0 0 auto}.switch input{display:none}.switch span{position:absolute;inset:0;background:#2b3542;border-radius:999px;cursor:pointer;transition:.2s}.switch span:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.switch input:checked+span{background:var(--green)}.switch input:checked+span:before{transform:translateX(20px)}.savebar{display:flex;justify-content:flex-end;margin-top:17px}.profile-list{display:grid;gap:12px}.profile-card{background:rgba(21,29,39,.76);border:1px solid var(--border);border-radius:13px;padding:17px}.profile-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.profile-name{font-size:.98rem;font-weight:850}.profile-type{color:var(--muted);font-size:.76rem;margin-top:3px}.profile-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.profile-field{display:flex;flex-direction:column;gap:7px}.profile-field label{color:var(--muted);font-size:.68rem;text-transform:uppercase;font-weight:800;letter-spacing:.05em}.profile-field select{width:100%;min-width:0}.profile-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:15px;padding-top:14px;border-top:1px solid var(--border)}.status-pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;background:#202a36;font-size:.72rem;font-weight:800}.status-pill.on{color:var(--green)}.status-pill.off{color:var(--muted)}.settings-title{margin-top:0;margin-bottom:12px}.settings-title h2{margin-bottom:4px}.settings-title p{margin:0}.tag-list{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.tag-chip{border:1px solid var(--border);background:#202a36;color:#e8edf2;border-radius:999px;padding:6px 10px;cursor:pointer;font-size:.75rem}.tag-chip:hover{border-color:var(--accent)}.tag-chip.selected{background:rgba(72,184,128,.14);border-color:var(--green);color:#fff;box-shadow:0 0 0 1px rgba(72,184,128,.12) inset}.retry-fields{grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}.retry-fields label{font-size:.68rem;color:var(--muted);text-transform:uppercase;font-weight:800}.retry-fields input{margin-top:5px}
 @media(max-width:1000px){.services{grid-template-columns:repeat(3,1fr)}.settings-grid{grid-template-columns:1fr}.profile-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:720px){main{padding:22px 15px 40px}.services{grid-template-columns:1fr 1fr}.app-header{align-items:flex-start}.tabs{overflow:auto;flex-wrap:nowrap}.tab{white-space:nowrap}.activity-row{grid-template-columns:1fr;gap:5px}.profile-grid{grid-template-columns:1fr 1fr}.profile-footer{align-items:flex-start;flex-direction:column}.savebar{justify-content:stretch}.savebar button{width:100%}.media-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){.services{grid-template-columns:1fr}.profile-grid{grid-template-columns:1fr}.version{display:none}.media-grid{grid-template-columns:1fr 1fr}}
 </style></head><body><main>
-<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.5.14</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.6.0</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="services">
 <div class="service-card"><div class="service-icon">✓</div><div><div class="service-name">ForcedFR</div><div class="service-meta"><span class="status-dot online"></span> Service actif</div></div></div>
 <div class="service-card"><div class="service-icon"><img src="https://cdn.simpleicons.org/qbittorrent" alt="qBittorrent"></div><div><div class="service-name">qBittorrent</div><div class="service-meta value" id="qb">…</div></div></div>
@@ -3222,7 +3470,7 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 <div class="config-group"><h4>Environnement</h4><label class="config-field"><span>Fuseau horaire</span><input id="cfgTZ" placeholder="Europe/Paris"></label></div>
 <div class="savebar"><button class="primary" onclick="saveConnectionSettings()">💾 Enregistrer les connexions</button></div><div class="small config-note">Les paramètres sont enregistrés dans SQLite. Les connexions qBittorrent / Radarr / Sonarr sont actualisées immédiatement. Un redémarrage est nécessaire après changement du token du bot Discord. Pour tester une connexion, enregistre d’abord les paramètres.</div>
 </div>
-<div><div class="settings-card"><h3>🏷️ Étiquettes qBittorrent ignorées</h3><p class="desc">Les torrents portant l’une de ces étiquettes ne seront pas analysés par ForcedFR.</p><label class="config-field"><span>Étiquettes ignorées</span><input id="cfgQBIgnoredTags" placeholder="cross-seed, autre-etiquette"></label><div class="small" style="margin-top:10px">Étiquettes actuellement disponibles dans qBittorrent :</div><div id="qbTagsAvailable" class="tag-list"></div><div class="config-note">Clique sur une étiquette pour l’ajouter. Tu peux aussi en saisir plusieurs manuellement.</div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les étiquettes</button></div></div><div class="settings-card" style="margin-top:18px"><h3>🔔 Notifications</h3><p class="desc">Choisis les événements qui doivent générer une notification.</p><div class="setting-item"><div class="setting-copy"><strong>Forced FR absent</strong><span>Notifier lorsqu'un torrent est mis en pause.</span></div><label class="switch"><input type="checkbox" id="setNoForced"><span></span></label></div><div class="setting-item"><div class="setting-copy"><strong>Erreur d'analyse</strong><span>Notifier lorsqu'une analyse FFprobe échoue.</span></div><label class="switch"><input type="checkbox" id="setErrors"><span></span></label></div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les notifications</button></div></div><div class="settings-title" style="margin-top:22px"><h2>Profils d'analyse</h2><p class="sub">Règles séparées pour les Films et les Séries.</p></div><div id="profiles" class="profile-list"></div></div>
+<div><div class="settings-card"><h3>🤖 Intelligence artificielle</h3><p class="desc">Gemini analyse uniquement les médias pour lesquels FFprobe n'a trouvé aucune piste FR Forced. Brave Search fournit les recherches Web utilisées par Gemini.</p><div class="setting-item"><div class="setting-copy"><strong>Analyse IA activée</strong><span>Interroger Gemini après une analyse sans Forced FR.</span></div><label class="switch"><input type="checkbox" id="setAiEnabled"><span></span></label></div><div class="setting-item"><div class="setting-copy"><strong>Recherche Web activée</strong><span>Utiliser Brave Search avant l'analyse Gemini.</span></div><label class="switch"><input type="checkbox" id="setWebEnabled"><span></span></label></div><label class="config-field"><span>Clé API Google AI Studio / Gemini</span><input id="cfgGeminiKey" type="password" placeholder="Laisser vide pour conserver"></label><label class="config-field"><span>Modèle Gemini</span><input id="cfgGeminiModel" placeholder="gemini-3.8-flash"></label><label class="config-field"><span>Clé API Brave Search</span><input id="cfgBraveKey" type="password" placeholder="Laisser vide pour conserver"></label><label class="config-field"><span>Résultats Brave par recherche</span><input id="cfgBraveCount" type="number" min="1" max="10" value="5"></label><div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px"><button class="test-btn" onclick="testConnection('gemini')">Tester Gemini</button><button class="test-btn" onclick="testConnection('brave')">Tester Brave Search</button></div><div id="test-gemini" class="test-result"></div><div id="test-brave" class="test-result"></div><div class="config-note">ForcedFR utilise 3 recherches Web ciblées puis envoie les résultats à Gemini. Si FFprobe trouve déjà un Forced FR, aucun appel IA ni recherche Web n'est effectué.</div><div class="savebar"><button class="primary" onclick="saveAISettings()">💾 Enregistrer l'IA</button></div></div><div class="settings-card" style="margin-top:18px"><h3>🏷️ Étiquettes qBittorrent ignorées</h3><p class="desc">Les torrents portant l’une de ces étiquettes ne seront pas analysés par ForcedFR.</p><label class="config-field"><span>Étiquettes ignorées</span><input id="cfgQBIgnoredTags" placeholder="cross-seed, autre-etiquette"></label><div class="small" style="margin-top:10px">Étiquettes actuellement disponibles dans qBittorrent :</div><div id="qbTagsAvailable" class="tag-list"></div><div class="config-note">Clique sur une étiquette pour l’ajouter. Tu peux aussi en saisir plusieurs manuellement.</div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les étiquettes</button></div></div><div class="settings-card" style="margin-top:18px"><h3>🔔 Notifications</h3><p class="desc">Choisis les événements qui doivent générer une notification.</p><div class="setting-item"><div class="setting-copy"><strong>Forced FR absent</strong><span>Notifier lorsqu'un torrent est mis en pause.</span></div><label class="switch"><input type="checkbox" id="setNoForced"><span></span></label></div><div class="setting-item"><div class="setting-copy"><strong>Erreur d'analyse</strong><span>Notifier lorsqu'une analyse FFprobe échoue.</span></div><label class="switch"><input type="checkbox" id="setErrors"><span></span></label></div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les notifications</button></div></div><div class="settings-title" style="margin-top:22px"><h2>Profils d'analyse</h2><p class="sub">Règles séparées pour les Films et les Séries.</p></div><div id="profiles" class="profile-list"></div></div>
 </div></section>
 
 <section id="p-history" class="panel"><h2>Historique des analyses</h2><p class="sub">Historique persistant des analyses et décisions prises sur les téléchargements.</p><div class="filters"><select id="historyFilter"><option value="all">Toutes les analyses</option><option value="forced_found">Forced FR détecté</option><option value="no_forced">Pas de Forced FR</option><option value="error">Erreurs</option></select><input id="historySearch" placeholder="Rechercher un torrent…"></div>
@@ -3259,15 +3507,16 @@ function renderHistory(){const q=($('historySearch')?.value||'').toLowerCase(),f
 async function loadDashboard(){const d=await api('/dashboard/stats');const l=d.library,t=d.torrents;const cards=[['Bibliothèque',l.total,'médias'],['Avec Forced FR',l.forced,'validés'],['Sans Forced FR',l.no_forced,'médias'],['🔴 À traiter',l.pending,'médias'],['🟠 En attente',l.waiting,'médias'],['🟢 Absence normale',l.validated,'médias'],['⚠ Erreurs',l.errors,'à traiter'],['Torrents analysés',t.total,'analyses']];$('dashCards').innerHTML=cards.map(c=>'<div class="card"><div class="label">'+c[0]+'</div><div class="value" style="font-size:1.5rem">'+c[1]+'</div><div class="small">'+c[2]+'</div></div>').join('');$('recent').innerHTML=d.recent.length?d.recent.map(i=>{const name=i.torrent_name||'Torrent';const texts={analysis:i.result==='forced_found'?'Analyse terminée : Forced FR détecté':i.result==='no_forced'?'Analyse terminée : aucun Forced FR':'Analyse terminée',auto_pause:'Téléchargement mis en pause automatiquement',pause:'Téléchargement maintenu en pause',resume:'Téléchargement repris'};const label=texts[i.action]||'Action effectuée';return '<div class="activity-row"><div class="activity-date">'+new Date(i.created_at*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</div><div class="activity-main"><div class="activity-action"><span class="activity-dot"></span>'+esc(label)+'</div><div class="activity-details">'+esc(name)+(i.details?' — '+esc(i.details):'')+'</div></div><div>'+ (i.result==='forced_found'?'<span class="badge yes">OK</span>':i.result==='no_forced'?'<span class="badge no">À traiter</span>':'<span class="badge err">Info</span>') +'</div></div>'}).join(''):'<div class="activity-empty">Aucune activité enregistrée pour le moment.</div>'}
 async function loadErrors(){const d=await api('/errors');$('errors').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.last_seen*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td><strong>'+esc(i.title||'—')+'</strong><div class="small">'+esc(i.media_type)+' · '+esc(i.path||'')+'</div></td><td>'+esc(i.error)+'</td><td><button class="review-btn" onclick="resolveError('+i.id+')">✓ Marquer traité</button></td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune erreur à traiter.</td></tr>'}
 async function resolveError(id){try{await api('/errors/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadErrors();loadDashboard()}catch(e){alert(e.message)}}
-async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value='';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value='';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value='';$('cfgDiscordToken').value='';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value='';$('cfgTZ').value=c.values.TZ||'';$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';loadQbTags();$('profiles').innerHTML=p.results.map(i=>'<div class="profile-card"><div class="profile-top"><div><div class="profile-name">'+esc(i.media_type==='Film'?'🎬 Films':'📺 Séries')+'</div><div class="profile-type">Règles appliquées aux analyses de ce type de média</div></div><span class="status-pill '+(i.enabled?'on':'off')+'">'+(i.enabled?'● Actif':'○ Inactif')+'</span></div><div class="profile-grid"><div class="profile-field"><label>Si Forced FR trouvé</label><select id="found-'+esc(i.name)+'"><option value="validate" '+(i.found_action==='validate'?'selected':'')+'>✓ Valider</option><option value="pause_notify" '+(i.found_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="validate_notify" '+(i.found_action==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option></select></div><div class="profile-field"><label>Si Forced FR absent</label><select id="tm-'+esc(i.name)+'"><option value="pause_notify" '+(i.torrent_missing_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="continue_notify" '+(i.torrent_missing_action==='continue_notify'?'selected':'')+'>▶ Continuer + notifier Discord</option><option value="pause_decision" '+(i.torrent_missing_action==='pause_decision'?'selected':'')+'>❓ Mettre en pause et demander une décision</option></select></div><div class="profile-field"><label>Après scan bibliothèque</label><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div><div class="profile-field"><label>Si erreur d’analyse</label><select id="err-'+esc(i.name)+'" onchange="toggleRetryFields('+JSON.stringify(i.name)+')"><option value="notify_continue" '+(i.error_action==='notify_continue'?'selected':'')+'>▶ Continuer + notifier</option><option value="pause_decision" '+(i.error_action==='pause_decision'?'selected':'')+'>⏸ Pause + demander une décision</option><option value="retry_pause" '+(i.error_action==='retry_pause'?'selected':'')+'>🔄 Réessayer puis mettre en pause</option><option value="retry_continue" '+(i.error_action==='retry_continue'?'selected':'')+'>🔄 Réessayer puis continuer</option></select><div class="retry-fields" id="retry-'+esc(i.name)+'" style="display:'+(i.error_action==='retry_pause'||i.error_action==='retry_continue'?'grid':'none')+'"><label>Nombre de tentatives<input type="number" min="1" max="20" id="retries-'+esc(i.name)+'" value="'+(i.error_retries||5)+'"></label><label>Délai entre tentatives (s)<input type="number" min="1" max="3600" id="delay-'+esc(i.name)+'" value="'+(i.error_retry_delay||30)+'"></label></div></div></div><div class="profile-footer"><label class="setting-item" style="padding:0;border:0;justify-content:flex-start"><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+' style="min-width:0;flex:none"><span>Profil actif</span></label><button type="button" class="primary profile-save" data-profile-name="'+esc(i.name)+'" data-profile-type="'+esc(i.media_type)+'" data-forced-required="'+(i.forced_required?'1':'0')+'">💾 Enregistrer</button></div></div>').join('');document.querySelectorAll('.profile-save').forEach(b=>b.addEventListener('click',()=>saveProfile(b.dataset.profileName,b.dataset.profileType,b.dataset.forcedRequired==='1')))}
+async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('setAiEnabled').checked=s.ai_enabled;$('setWebEnabled').checked=s.web_search_enabled;$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value='';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value='';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value='';$('cfgDiscordToken').value='';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value='';$('cfgTZ').value=c.values.TZ||'';$('cfgGeminiKey').value='';$('cfgGeminiModel').value=c.values.GEMINI_MODEL||'gemini-3.8-flash';$('cfgBraveKey').value='';$('cfgBraveCount').value=c.values.BRAVE_RESULTS_COUNT||5;$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';loadQbTags();$('profiles').innerHTML=p.results.map(i=>'<div class="profile-card"><div class="profile-top"><div><div class="profile-name">'+esc(i.media_type==='Film'?'🎬 Films':'📺 Séries')+'</div><div class="profile-type">Règles appliquées aux analyses de ce type de média</div></div><span class="status-pill '+(i.enabled?'on':'off')+'">'+(i.enabled?'● Actif':'○ Inactif')+'</span></div><div class="profile-grid"><div class="profile-field"><label>Si Forced FR trouvé</label><select id="found-'+esc(i.name)+'"><option value="validate" '+(i.found_action==='validate'?'selected':'')+'>✓ Valider</option><option value="pause_notify" '+(i.found_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="validate_notify" '+(i.found_action==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option></select></div><div class="profile-field"><label>Si Forced FR absent</label><select id="tm-'+esc(i.name)+'"><option value="pause_notify" '+(i.torrent_missing_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue_notify" '+(i.torrent_missing_action==='continue_notify'?'selected':'')+'>▶ Continuer + notifier Discord</option><option value="pause_decision" '+(i.torrent_missing_action==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option></select></div><div class="profile-field"><label>Gemini : NÉCESSAIRE</label><select id="ain-'+esc(i.name)+'"><option value="pause_notify" '+(i.ai_needed_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue" '+(i.ai_needed_action==='continue'?'selected':'')+'>▶ Continuer le téléchargement</option><option value="pause_decision" '+(i.ai_needed_action==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option></select></div><div class="profile-field"><label>Gemini : NON NÉCESSAIRE</label><select id="ainno-'+esc(i.name)+'"><option value="continue" '+(i.ai_not_needed_action==='continue'?'selected':'')+'>▶ Continuer le téléchargement</option><option value="continue_notify" '+(i.ai_not_needed_action==='continue_notify'?'selected':'')+'>🔔 Continuer + notifier Discord</option><option value="pause_notify" '+(i.ai_not_needed_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="pause_decision" '+(i.ai_not_needed_action==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option></select></div><div class="profile-field"><label>Gemini : INDETERMINÉ</label><select id="aiu-'+esc(i.name)+'"><option value="pause_decision" '+(i.ai_unknown_action==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option><option value="pause_notify" '+(i.ai_unknown_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue" '+(i.ai_unknown_action==='continue'?'selected':'')+'>▶ Continuer le téléchargement</option></select></div><div class="profile-field"><label>Après scan bibliothèque</label><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div><div class="profile-field"><label>Si erreur d’analyse</label><select id="err-'+esc(i.name)+'" onchange="toggleRetryFields('+JSON.stringify(i.name)+')"><option value="notify_continue" '+(i.error_action==='notify_continue'?'selected':'')+'>▶ Continuer + notifier</option><option value="pause_decision" '+(i.error_action==='pause_decision'?'selected':'')+'>⏸ Pause + demander une décision</option><option value="retry_pause" '+(i.error_action==='retry_pause'?'selected':'')+'>🔄 Réessayer puis mettre en pause</option><option value="retry_continue" '+(i.error_action==='retry_continue'?'selected':'')+'>🔄 Réessayer puis continuer</option></select><div class="retry-fields" id="retry-'+esc(i.name)+'" style="display:'+(i.error_action==='retry_pause'||i.error_action==='retry_continue'?'grid':'none')+'"><label>Nombre de tentatives<input type="number" min="1" max="20" id="retries-'+esc(i.name)+'" value="'+(i.error_retries||5)+'"></label><label>Délai entre tentatives (s)<input type="number" min="1" max="3600" id="delay-'+esc(i.name)+'" value="'+(i.error_retry_delay||30)+'"></label></div></div></div><div class="profile-footer"><label class="setting-item" style="padding:0;border:0;justify-content:flex-start"><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+' style="min-width:0;flex:none"><span>Profil actif</span></label><button type="button" class="primary profile-save" data-profile-name="'+esc(i.name)+'" data-profile-type="'+esc(i.media_type)+'" data-forced-required="'+(i.forced_required?'1':'0')+'">💾 Enregistrer</button></div></div>').join('');document.querySelectorAll('.profile-save').forEach(b=>b.addEventListener('click',()=>saveProfile(b.dataset.profileName,b.dataset.profileType,b.dataset.forcedRequired==='1')))}
 function toggleRetryFields(name){const v=$('err-'+name).value;const box=$('retry-'+name);if(box)box.style.display=(v==='retry_pause'||v==='retry_continue')?'grid':'none'}
 async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,found_action:$('found-'+name).value,torrent_missing_action:$('tm-'+name).value,error_action:$('err-'+name).value,error_retries:parseInt($('retries-'+name)?.value||5,10),error_retry_delay:parseFloat($('delay-'+name)?.value||30),enabled:$('ena-'+name).checked})});alert('Profil enregistré.')}catch(e){alert(e.message)}}
 async function testConnection(kind){const el=$('test-'+kind);el.className='test-result warn';el.textContent='Test en cours…';try{const d=await api('/test/'+kind,{method:'POST'});el.className='test-result '+(d.ok?'ok':'bad');el.textContent=(d.ok?'✓ ':'✕ ')+d.message}catch(e){el.className='test-result bad';el.textContent='✕ '+e.message}}
 async function loadQbTags(){try{const d=await api('/qbittorrent/tags');const box=$('qbTagsAvailable');if(!box)return;if(!d.results.length){box.innerHTML='<span class="small">Aucune étiquette trouvée dans qBittorrent.</span>';return}box.innerHTML=d.results.map(t=>'<button type="button" class="tag-chip" data-qb-tag="'+esc(t)+'">'+esc(t)+'</button>').join('');box.querySelectorAll('.tag-chip').forEach(b=>b.addEventListener('click',()=>addIgnoredTag(b.dataset.qbTag,b)))}catch(e){const box=$('qbTagsAvailable');if(box)box.innerHTML='<span class="small warn">Impossible de récupérer les étiquettes qBittorrent.</span>'}}
 function addIgnoredTag(tag,button){const input=$('cfgQBIgnoredTags');const current=input.value.split(',').map(x=>x.trim()).filter(Boolean);const exists=current.some(x=>x.toLowerCase()===tag.toLowerCase());if(!exists){current.push(tag);input.value=current.join(', ')}if(button){button.classList.toggle('selected',true);button.title='Étiquette déjà sélectionnée';}}
 
-async function saveConnectionSettings(){try{const payload={QB_HOST:$('cfgQBHost').value,QB_USERNAME:$('cfgQBUsername').value,QB_PASSWORD:$('cfgQBPassword').value,RADARR_URL:$('cfgRadarrUrl').value,RADARR_API_KEY:$('cfgRadarrKey').value,SONARR_URL:$('cfgSonarrUrl').value,SONARR_API_KEY:$('cfgSonarrKey').value,DISCORD_BOT_TOKEN:$('cfgDiscordToken').value,DISCORD_CHANNEL_ID:$('cfgDiscordChannel').value,DISCORD_WEBHOOK_URL:$('cfgDiscordWebhook').value,TZ:$('cfgTZ').value};await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Connexions enregistrées.');refresh()}catch(e){alert(e.message)}}
-async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked,qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
+async function saveConnectionSettings(){try{const payload={QB_HOST:$('cfgQBHost').value,QB_USERNAME:$('cfgQBUsername').value,QB_PASSWORD:$('cfgQBPassword').value,RADARR_URL:$('cfgRadarrUrl').value,RADARR_API_KEY:$('cfgRadarrKey').value,SONARR_URL:$('cfgSonarrUrl').value,SONARR_API_KEY:$('cfgSonarrKey').value,DISCORD_BOT_TOKEN:$('cfgDiscordToken').value,DISCORD_CHANNEL_ID:$('cfgDiscordChannel').value,DISCORD_WEBHOOK_URL:$('cfgDiscordWebhook').value,TZ:$('cfgTZ').value,GEMINI_API_KEY:$('cfgGeminiKey').value,GEMINI_MODEL:$('cfgGeminiModel').value,BRAVE_SEARCH_API_KEY:$('cfgBraveKey').value,BRAVE_RESULTS_COUNT:$('cfgBraveCount').value};await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qb_ignored_tags:$('cfgQBIgnoredTags').value,ai_enabled:$('setAiEnabled').checked,web_search_enabled:$('setWebEnabled').checked})});alert('Connexions enregistrées.');refresh()}catch(e){alert(e.message)}}
+async function saveAISettings(){try{await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({GEMINI_API_KEY:$('cfgGeminiKey').value,GEMINI_MODEL:$('cfgGeminiModel').value,BRAVE_SEARCH_API_KEY:$('cfgBraveKey').value,BRAVE_RESULTS_COUNT:$('cfgBraveCount').value})});await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ai_enabled:$('setAiEnabled').checked,web_search_enabled:$('setWebEnabled').checked})});alert('Paramètres IA enregistrés.');refresh()}catch(e){alert(e.message)}}
+async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked,qb_ignored_tags:$('cfgQBIgnoredTags').value,ai_enabled:$('setAiEnabled').checked,web_search_enabled:$('setWebEnabled').checked})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
 $('historyFilter').onchange=renderHistory;$('historySearch').oninput=renderHistory;
 async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}(async()=>{try{await loadCached('all')}catch(e){console.error(e)}loadDashboard();refresh()})();
 </script></main></body></html>"""
@@ -3281,7 +3530,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.5.14",
+        "version": "2.6.0",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -3378,9 +3627,27 @@ def test_discord() -> dict[str, Any]:
         return {"ok": False, "message": f"Discord : {exc}"}
 
 
+@app.post("/test/gemini")
+def test_gemini() -> dict[str, Any]:
+    try:
+        result = _gemini_generate_json('Réponds uniquement en JSON: {"ok": true, "message": "Gemini connecté"}')
+        return {"ok": bool(result.get("ok", True)), "message": "Gemini connecté et API fonctionnelle."}
+    except Exception as exc:
+        return {"ok": False, "message": f"Gemini : {exc}"}
+
+
+@app.post("/test/brave")
+def test_brave() -> dict[str, Any]:
+    try:
+        results = brave_web_search("Forced subtitles français film test", count=1)
+        return {"ok": True, "message": f"Brave Search connecté — {len(results)} résultat(s) reçu(s)."}
+    except Exception as exc:
+        return {"ok": False, "message": f"Brave Search : {exc}"}
+
+
 @app.get("/configuration")
 def configuration() -> dict[str, Any]:
-    secret_keys = {"DISCORD_BOT_TOKEN", "DISCORD_WEBHOOK_URL", "QB_PASSWORD", "RADARR_API_KEY", "SONARR_API_KEY"}
+    secret_keys = {"DISCORD_BOT_TOKEN", "DISCORD_WEBHOOK_URL", "QB_PASSWORD", "RADARR_API_KEY", "SONARR_API_KEY", "GEMINI_API_KEY", "BRAVE_SEARCH_API_KEY"}
     values: dict[str, Any] = {}
     configured: dict[str, bool] = {}
     for key, fallback in CONFIG_FALLBACKS.items():
@@ -3395,8 +3662,8 @@ def configuration() -> dict[str, Any]:
 @app.post("/configuration")
 def update_configuration(payload: dict[str, Any]) -> dict[str, Any]:
     global DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_WEBHOOK_URL, QB_HOST, QB_PASSWORD, QB_USERNAME
-    global RADARR_API_KEY, RADARR_URL, SONARR_API_KEY, SONARR_URL
-    secret_keys = {"DISCORD_BOT_TOKEN", "DISCORD_WEBHOOK_URL", "QB_PASSWORD", "RADARR_API_KEY", "SONARR_API_KEY"}
+    global RADARR_API_KEY, RADARR_URL, SONARR_API_KEY, SONARR_URL, GEMINI_API_KEY, GEMINI_MODEL, BRAVE_SEARCH_API_KEY, BRAVE_RESULTS_COUNT
+    secret_keys = {"DISCORD_BOT_TOKEN", "DISCORD_WEBHOOK_URL", "QB_PASSWORD", "RADARR_API_KEY", "SONARR_API_KEY", "GEMINI_API_KEY", "BRAVE_SEARCH_API_KEY"}
     for key in CONFIG_FALLBACKS:
         if key not in payload: continue
         value = str(payload.get(key) or "").strip()
@@ -3416,6 +3683,8 @@ def settings() -> dict[str, Any]:
         "notify_no_forced": _setting_bool("notify_no_forced", True),
         "notify_errors": _setting_bool("notify_errors", True),
         "qb_ignored_tags": _setting("qb_ignored_tags", ""),
+        "ai_enabled": _setting_bool("ai_enabled", True),
+        "web_search_enabled": _setting_bool("web_search_enabled", True),
     }
 
 
@@ -3428,6 +3697,10 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if "qb_ignored_tags" in payload:
         tags = str(payload.get("qb_ignored_tags") or "")
         set_setting("qb_ignored_tags", tags)
+    if "ai_enabled" in payload:
+        set_setting("ai_enabled", "1" if bool(payload["ai_enabled"]) else "0")
+    if "web_search_enabled" in payload:
+        set_setting("web_search_enabled", "1" if bool(payload["web_search_enabled"]) else "0")
     return settings()
 
 
@@ -3448,10 +3721,10 @@ def update_profile(payload: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Type de média invalide.")
     with _db_connect() as conn:
         conn.execute("""
-            INSERT INTO forcedfr_profiles(name,media_type,forced_required,missing_action,error_action,enabled,updated_at,error_retries,error_retry_delay,found_action,torrent_missing_action)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(name) DO UPDATE SET media_type=excluded.media_type,forced_required=excluded.forced_required,missing_action=excluded.missing_action,error_action=excluded.error_action,enabled=excluded.enabled,updated_at=excluded.updated_at,error_retries=excluded.error_retries,error_retry_delay=excluded.error_retry_delay,found_action=excluded.found_action,torrent_missing_action=excluded.torrent_missing_action
-        """, (name,media_type,int(bool(payload.get("forced_required",True))),str(payload.get("missing_action") or "review"),str(payload.get("error_action") or "notify_continue"),int(bool(payload.get("enabled",True))),time.time(),max(1,min(20,int(payload.get("error_retries") or 5))),max(1.0,min(3600.0,float(payload.get("error_retry_delay") or 30))),str(payload.get("found_action") or "validate"),str(payload.get("torrent_missing_action") or "pause_notify")))
+            INSERT INTO forcedfr_profiles(name,media_type,forced_required,missing_action,error_action,enabled,updated_at,error_retries,error_retry_delay,found_action,torrent_missing_action,ai_needed_action,ai_not_needed_action,ai_unknown_action)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(name) DO UPDATE SET media_type=excluded.media_type,forced_required=excluded.forced_required,missing_action=excluded.missing_action,error_action=excluded.error_action,enabled=excluded.enabled,updated_at=excluded.updated_at,error_retries=excluded.error_retries,error_retry_delay=excluded.error_retry_delay,found_action=excluded.found_action,torrent_missing_action=excluded.torrent_missing_action,ai_needed_action=excluded.ai_needed_action,ai_not_needed_action=excluded.ai_not_needed_action,ai_unknown_action=excluded.ai_unknown_action
+        """, (name,media_type,int(bool(payload.get("forced_required",True))),str(payload.get("missing_action") or "review"),str(payload.get("error_action") or "notify_continue"),int(bool(payload.get("enabled",True))),time.time(),max(1,min(20,int(payload.get("error_retries") or 5))),max(1.0,min(3600.0,float(payload.get("error_retry_delay") or 30))),str(payload.get("found_action") or "validate"),str(payload.get("torrent_missing_action") or "pause_notify"),str(payload.get("ai_needed_action") or "pause_notify"),str(payload.get("ai_not_needed_action") or "continue"),str(payload.get("ai_unknown_action") or "pause_decision")))
     return {"ok": True}
 
 
