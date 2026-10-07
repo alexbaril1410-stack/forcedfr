@@ -75,8 +75,7 @@ STARTUP_STABLE_CHECKS_REQUIRED = 3
 # Base SQLite persistante pour les analyses de bibliothèque.
 SQLITE_PATH = os.getenv("SQLITE_PATH", "/app/data/forcedfr.db")
 
-# IA : Brave Search + Groq. La recherche Web reste séparée du raisonnement
-# afin de limiter les tokens consommés par le modèle.
+# IA : Brave Search + Groq
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b").strip()
 BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
@@ -104,7 +103,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.6.3",
+    version="2.6.5",
 )
 
 
@@ -1548,9 +1547,27 @@ def _ai_cache_get(media_type: str, title: str) -> dict[str, Any] | None:
     if not row:
         return None
     data = dict(row)
-    try: data["sources"] = json.loads(data.get("sources") or "[]")
-    except Exception: data["sources"] = []
+    try:
+        data["sources"] = json.loads(data.get("sources") or "[]")
+    except Exception:
+        data["sources"] = []
+    recommendation = str(data.get("recommendation") or data.get("result") or "").strip().upper()
+    model = str(data.get("model") or "").strip()
+    researched_at = float(data.get("researched_at") or data.get("searched_at") or 0)
+    current_model = str(GROQ_MODEL or _setting("config_GROQ_MODEL", "openai/gpt-oss-120b")).strip()
+    if recommendation not in {"NÉCESSAIRE", "NON NÉCESSAIRE", "INDETERMINÉ"}:
+        return None
+    if researched_at <= 0:
+        return None
+    # Les anciens résultats Gemini restent dans l'historique mais ne doivent pas
+    # être réutilisés après le passage à Groq.
+    if model and current_model and model != current_model:
+        log.info("Cache IA ignoré : ancien modèle %s (modèle actuel %s).", model, current_model)
+        return None
+    data["recommendation"] = recommendation
+    data["researched_at"] = researched_at
     return data
+
 
 
 def _ai_cache_put(media_type: str, title: str, result: dict[str, Any]) -> None:
@@ -1560,35 +1577,59 @@ def _ai_cache_put(media_type: str, title: str, result: dict[str, Any]) -> None:
     justification = str(result.get("justification") or "")
     sources = json.dumps(result.get("sources") or [], ensure_ascii=False)
     model = str(result.get("model") or GROQ_MODEL)
-    searched_at = time.time()
+    now = time.time()
+    year = str(result.get("year") or "")
+    brave_queries = json.dumps(result.get("brave_queries") or [], ensure_ascii=False)
+
+    # Compatibilité avec toutes les structures ai_research_cache rencontrées
+    # pendant les versions 2.6.x. Certaines anciennes bases imposent encore
+    # result, year, researched_at et brave_queries en NOT NULL.
+    values = {
+        "cache_key": key,
+        "media_type": media_type,
+        "title": title,
+        "year": year,
+        "result": recommendation,
+        "recommendation": recommendation,
+        "confidence": confidence,
+        "justification": justification,
+        "sources": sources,
+        "model": model,
+        "researched_at": now,
+        "searched_at": now,
+        "brave_queries": brave_queries,
+    }
+
     with _db_connect() as conn:
-        # Compatibilité avec les anciennes tables ai_research_cache : certaines
-        # bases de test possèdent encore une colonne `result` NOT NULL.
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(ai_research_cache)").fetchall()}
-        if "result" in columns:
-            conn.execute("""INSERT INTO ai_research_cache(
-                    cache_key,media_type,title,result,recommendation,confidence,
-                    justification,sources,model,searched_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    media_type=excluded.media_type, title=excluded.title,
-                    result=excluded.result, recommendation=excluded.recommendation,
-                    confidence=excluded.confidence, justification=excluded.justification,
-                    sources=excluded.sources, model=excluded.model, searched_at=excluded.searched_at""",
-                (key, media_type, title, recommendation, recommendation, confidence,
-                 justification, sources, model, searched_at))
+        columns_info = conn.execute("PRAGMA table_info(ai_research_cache)").fetchall()
+        if not columns_info:
+            raise RuntimeError("Table ai_research_cache introuvable après initialisation SQLite.")
+
+        columns = [row[1] for row in columns_info]
+        # Toute colonne NOT NULL sans valeur explicite doit recevoir une valeur
+        # sûre, afin qu'une évolution de schéma future ne casse pas le cache.
+        for row in columns_info:
+            name = row[1]
+            notnull = bool(row[3])
+            default = row[4]
+            pk = bool(row[5])
+            if name not in values and notnull and not pk and default is None:
+                ctype = (row[2] or "").upper()
+                values[name] = 0 if any(t in ctype for t in ("INT", "REAL", "NUM", "FLOA", "DOUB")) else ""
+
+        insert_columns = [c for c in columns if c in values]
+        if "cache_key" not in insert_columns:
+            raise RuntimeError("Table ai_research_cache sans colonne cache_key.")
+        placeholders = ",".join("?" for _ in insert_columns)
+        quoted = ",".join(f'"{c}"' for c in insert_columns)
+        update_columns = [c for c in insert_columns if c != "cache_key"]
+        if update_columns:
+            updates = ",".join(f'"{c}"=excluded."{c}"' for c in update_columns)
+            sql = f"INSERT INTO ai_research_cache ({quoted}) VALUES ({placeholders}) ON CONFLICT(cache_key) DO UPDATE SET {updates}"
         else:
-            conn.execute("""INSERT INTO ai_research_cache(
-                    cache_key,media_type,title,recommendation,confidence,
-                    justification,sources,model,searched_at
-                ) VALUES(?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(cache_key) DO UPDATE SET
-                    media_type=excluded.media_type, title=excluded.title,
-                    recommendation=excluded.recommendation, confidence=excluded.confidence,
-                    justification=excluded.justification, sources=excluded.sources,
-                    model=excluded.model, searched_at=excluded.searched_at""",
-                (key, media_type, title, recommendation, confidence, justification,
-                 sources, model, searched_at))
+            sql = f"INSERT OR IGNORE INTO ai_research_cache ({quoted}) VALUES ({placeholders})"
+        conn.execute(sql, tuple(values[c] for c in insert_columns))
+
 
 
 def _brave_search(title: str, media_type: str) -> list[dict[str, str]]:
@@ -1685,7 +1726,6 @@ def _apply_ai_failure(torrent: dict[str,Any], error: str, release: dict[str,Any]
     record_torrent_action(h,"auto_pause",source="ai",details=str(error)[:1000])
     notify_analysis_error(torrent,error,action_text=text,release=release)
     return text
-
 
 def process_new_torrent(
     torrent_hash: str,
@@ -1845,7 +1885,33 @@ def process_new_torrent(
 
                 profile, release = _torrent_profile_for_torrent(torrent)
                 name = str(torrent.get("name", ""))
+
+                # La mécanique v2.6.5 reste inchangée jusqu'à l'analyse FFprobe.
+                # Une fois le MKV lisible et sans FR Forced, on met le torrent en pause
+                # avant la recherche externe afin que Brave/Groq ne laisse jamais le
+                # téléchargement se poursuivre pendant la décision.
+                stop_torrent(torrent_hash)
+                record_torrent_action(torrent_hash, "auto_pause", source="ai", details="Pause avant recherche Brave/Groq après absence de FR Forced.")
+                log.info("[%s] ⏸️ Torrent mis en pause avant la décision IA.", torrent_hash)
+
                 media_type = str(profile.get("media_type") or ("Série" if "series" in name.lower() else "Film"))
+
+                # Si l'IA est désactivée, on conserve exactement le comportement
+                # historique de la v2.5.14 pour une absence de FR Forced.
+                if not AI_ENABLED or not _setting_bool("ai_enabled", True):
+                    missing_action = str(profile.get("torrent_missing_action") or "pause_notify")
+                    if missing_action == "continue_notify":
+                        start_torrent(torrent_hash)
+                        action_text = "▶️ Téléchargement poursuivi. Aucune piste FR Forced détectée."
+                        record_torrent_action(torrent_hash, "resume", source="forcedfr", details="Téléchargement poursuivi après analyse sans piste FR Forced.")
+                    elif missing_action == "pause_decision":
+                        action_text = "⏸️ Torrent laissé en pause. Une décision est demandée dans Discord."
+                    else:
+                        action_text = "⏸️ Torrent laissé en pause. Aucune piste FR Forced détectée."
+                    notify_profile_decision(torrent, "🚨 Aucun Forced FR détecté", f"Aucune piste française Forced n'a été trouvée dans **{name}**.", action_text, release)
+                    record_analysis_history(torrent_hash, name, "no_forced", action_text)
+                    return
+
                 try:
                     ai_result = research_forced_fr_with_ai(torrent, media_type, name, result)
                     decision = str(ai_result.get("recommendation") or "INDETERMINÉ").upper()
@@ -1971,6 +2037,7 @@ def process_new_torrent(
         log.info(
             "========================================"
         )
+
 
 
 # ============================================================
@@ -2218,7 +2285,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.6.3",
+        "version": "2.6.5",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -2503,12 +2570,16 @@ def init_database() -> None:
         ai_cache_migrations = (
             ("media_type", "TEXT NOT NULL DEFAULT 'Film'"),
             ("title", "TEXT NOT NULL DEFAULT ''"),
+            ("year", "TEXT NOT NULL DEFAULT ''"),
+            ("result", "TEXT NOT NULL DEFAULT 'INDETERMINÉ'"),
             ("recommendation", "TEXT NOT NULL DEFAULT 'INDETERMINÉ'"),
             ("confidence", "REAL DEFAULT 0"),
             ("justification", "TEXT DEFAULT ''"),
             ("sources", "TEXT NOT NULL DEFAULT '[]'"),
             ("model", "TEXT DEFAULT ''"),
+            ("researched_at", "REAL NOT NULL DEFAULT 0"),
             ("searched_at", "REAL NOT NULL DEFAULT 0"),
+            ("brave_queries", "TEXT NOT NULL DEFAULT '[]'"),
         )
         for column, definition in ai_cache_migrations:
             if column not in ai_cache_columns:
@@ -2585,6 +2656,7 @@ def init_database() -> None:
         if "ai_indeterminate_action" not in cols:
             conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN ai_indeterminate_action TEXT NOT NULL DEFAULT 'pause_decision'")
     log.info("SQLite initialisée : %s", SQLITE_PATH)
+
 
 
 def _setting(key: str, default: str = "") -> str:
@@ -3378,7 +3450,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.6.3</title>
+<title>ForcedFR v2.6.5</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -3394,7 +3466,7 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 .settings-grid{display:grid;grid-template-columns:minmax(290px,.8fr) minmax(0,1.5fr);gap:18px;align-items:start}.settings-card{padding:19px}.settings-card h3{margin:0 0 6px}.settings-card .desc{color:var(--muted);font-size:.84rem;line-height:1.5;margin:0 0 16px}.setting-item{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:14px 0;border-top:1px solid var(--border)}.setting-item:first-of-type{border-top:0}.setting-copy strong{display:block;font-size:.85rem}.setting-copy span{display:block;color:var(--muted);font-size:.76rem;margin-top:4px}.switch{position:relative;width:44px;height:24px;flex:0 0 auto}.switch input{display:none}.switch span{position:absolute;inset:0;background:#2b3542;border-radius:999px;cursor:pointer;transition:.2s}.switch span:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.switch input:checked+span{background:var(--green)}.switch input:checked+span:before{transform:translateX(20px)}.savebar{display:flex;justify-content:flex-end;margin-top:17px}.profile-list{display:grid;gap:12px}.profile-card{background:rgba(21,29,39,.76);border:1px solid var(--border);border-radius:13px;padding:17px}.profile-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.profile-name{font-size:.98rem;font-weight:850}.profile-type{color:var(--muted);font-size:.76rem;margin-top:3px}.profile-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.profile-field{display:flex;flex-direction:column;gap:7px}.profile-field label{color:var(--muted);font-size:.68rem;text-transform:uppercase;font-weight:800;letter-spacing:.05em}.profile-field select{width:100%;min-width:0}.profile-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:15px;padding-top:14px;border-top:1px solid var(--border)}.status-pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;background:#202a36;font-size:.72rem;font-weight:800}.status-pill.on{color:var(--green)}.status-pill.off{color:var(--muted)}.settings-title{margin-top:0;margin-bottom:12px}.settings-title h2{margin-bottom:4px}.settings-title p{margin:0}.tag-list{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.tag-chip{border:1px solid var(--border);background:#202a36;color:#e8edf2;border-radius:999px;padding:6px 10px;cursor:pointer;font-size:.75rem}.tag-chip:hover{border-color:var(--accent)}.tag-chip.selected{background:rgba(72,184,128,.14);border-color:var(--green);color:#fff;box-shadow:0 0 0 1px rgba(72,184,128,.12) inset}.retry-fields{grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}.retry-fields label{font-size:.68rem;color:var(--muted);text-transform:uppercase;font-weight:800}.retry-fields input{margin-top:5px}
 @media(max-width:1000px){.services{grid-template-columns:repeat(3,1fr)}.settings-grid{grid-template-columns:1fr}.profile-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:720px){main{padding:22px 15px 40px}.services{grid-template-columns:1fr 1fr}.app-header{align-items:flex-start}.tabs{overflow:auto;flex-wrap:nowrap}.tab{white-space:nowrap}.activity-row{grid-template-columns:1fr;gap:5px}.profile-grid{grid-template-columns:1fr 1fr}.profile-footer{align-items:flex-start;flex-direction:column}.savebar{justify-content:stretch}.savebar button{width:100%}.media-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){.services{grid-template-columns:1fr}.profile-grid{grid-template-columns:1fr}.version{display:none}.media-grid{grid-template-columns:1fr 1fr}}
 </style></head><body><main>
-<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.6.3</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.6.5</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="services">
 <div class="service-card"><div class="service-icon">✓</div><div><div class="service-name">ForcedFR</div><div class="service-meta"><span class="status-dot online"></span> Service actif</div></div></div>
 <div class="service-card"><div class="service-icon"><img src="https://cdn.simpleicons.org/qbittorrent" alt="qBittorrent"></div><div><div class="service-name">qBittorrent</div><div class="service-meta value" id="qb">…</div></div></div>
@@ -3418,7 +3490,6 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 
 <section id="p-errors" class="panel"><h2>Erreurs à traiter</h2><p class="sub">Erreurs persistantes du scan de bibliothèque. Une réussite lors d'un prochain scan les clôture automatiquement.</p><div class="toolbar"><button onclick="startScan('films','incremental')">↻ Relancer Films</button><button onclick="startScan('series','incremental')">↻ Relancer Séries</button><button onclick="startScan('all','incremental')">↻ Relancer toute la bibliothèque</button></div><div class="tablewrap" style="margin-top:14px"><table><thead><tr><th>Dernière détection</th><th>Média</th><th>Erreur</th><th>Action</th></tr></thead><tbody id="errors"></tbody></table></div></section>
 
-<section class="card" style="margin-bottom:14px"><div class="section-head" style="margin:0 0 12px"><div><h2>🤖 Intelligence artificielle</h2><p class="sub">Brave Search recherche sur le Web ; Groq analyse uniquement les résultats trouvés.</p></div></div><div class="grid"><label class="setting-item"><span class="setting-copy"><strong>IA activée</strong><span>Analyse uniquement lorsqu'aucune FR Forced n'est détectée.</span></span><span class="switch"><input type="checkbox" id="cfgAIEnabled"><span></span></span></label><label class="profile-field"><label>Modèle Groq</label><input id="cfgGroqModel" placeholder="openai/gpt-oss-120b"></label><label class="profile-field"><label>Clé API Groq</label><input id="cfgGroqKey" type="password" placeholder="••••••••"></label><label class="profile-field"><label>Clé API Brave Search</label><input id="cfgBraveKey" type="password" placeholder="••••••••"></label><label class="profile-field"><label>Résultats Brave</label><input id="cfgBraveCount" type="number" min="1" max="10" value="5"></label></div><div style="margin-top:12px"><button type="button" class="primary" onclick="testAIConfig()">🧪 Tester Brave + Groq</button></div></section>
 <section id="p-settings" class="panel">
 <div class="section-head"><div><h2>Paramètres</h2><p class="sub">Toutes les connexions de ForcedFR sont configurables ici. Les paramètres sont conservés dans SQLite et survivent aux redémarrages. Les secrets sont masqués.</p></div></div>
 <div class="settings-grid">
@@ -3467,15 +3538,14 @@ function renderHistory(){const q=($('historySearch')?.value||'').toLowerCase(),f
 async function loadDashboard(){const d=await api('/dashboard/stats');const l=d.library,t=d.torrents;const cards=[['Bibliothèque',l.total,'médias'],['Avec Forced FR',l.forced,'validés'],['Sans Forced FR',l.no_forced,'médias'],['🔴 À traiter',l.pending,'médias'],['🟠 En attente',l.waiting,'médias'],['🟢 Absence normale',l.validated,'médias'],['⚠ Erreurs',l.errors,'à traiter'],['Torrents analysés',t.total,'analyses']];$('dashCards').innerHTML=cards.map(c=>'<div class="card"><div class="label">'+c[0]+'</div><div class="value" style="font-size:1.5rem">'+c[1]+'</div><div class="small">'+c[2]+'</div></div>').join('');$('recent').innerHTML=d.recent.length?d.recent.map(i=>{const name=i.torrent_name||'Torrent';const texts={analysis:i.result==='forced_found'?'Analyse terminée : Forced FR détecté':i.result==='no_forced'?'Analyse terminée : aucun Forced FR':'Analyse terminée',auto_pause:'Téléchargement mis en pause automatiquement',pause:'Téléchargement maintenu en pause',resume:'Téléchargement repris'};const label=texts[i.action]||'Action effectuée';return '<div class="activity-row"><div class="activity-date">'+new Date(i.created_at*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</div><div class="activity-main"><div class="activity-action"><span class="activity-dot"></span>'+esc(label)+'</div><div class="activity-details">'+esc(name)+(i.details?' — '+esc(i.details):'')+'</div></div><div>'+ (i.result==='forced_found'?'<span class="badge yes">OK</span>':i.result==='no_forced'?'<span class="badge no">À traiter</span>':'<span class="badge err">Info</span>') +'</div></div>'}).join(''):'<div class="activity-empty">Aucune activité enregistrée pour le moment.</div>'}
 async function loadErrors(){const d=await api('/errors');$('errors').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.last_seen*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td><strong>'+esc(i.title||'—')+'</strong><div class="small">'+esc(i.media_type)+' · '+esc(i.path||'')+'</div></td><td>'+esc(i.error)+'</td><td><button class="review-btn" onclick="resolveError('+i.id+')">✓ Marquer traité</button></td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune erreur à traiter.</td></tr>'}
 async function resolveError(id){try{await api('/errors/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadErrors();loadDashboard()}catch(e){alert(e.message)}}
-async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value='';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value='';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value='';$('cfgDiscordToken').value='';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value='';$('cfgTZ').value=c.values.TZ||'';$('cfgGroqModel').value=c.values.GROQ_MODEL||'openai/gpt-oss-120b';$('cfgGroqKey').value='';$('cfgBraveKey').value='';$('cfgAIEnabled').checked=s.ai_enabled;$('cfgBraveCount').value=s.brave_results_count||5;$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';loadQbTags();$('profiles').innerHTML=p.results.map(i=>'<div class="profile-card"><div class="profile-top"><div><div class="profile-name">'+esc(i.media_type==='Film'?'🎬 Films':'📺 Séries')+'</div><div class="profile-type">Règles appliquées aux analyses de ce type de média</div></div><span class="status-pill '+(i.enabled?'on':'off')+'">'+(i.enabled?'● Actif':'○ Inactif')+'</span></div><div class="profile-grid"><div class="profile-field"><label>Si Forced FR trouvé</label><select id="found-'+esc(i.name)+'"><option value="validate" '+(i.found_action==='validate'?'selected':'')+'>✓ Valider</option><option value="pause_notify" '+(i.found_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="validate_notify" '+(i.found_action==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option></select></div><div class="profile-field"><label>Si Forced FR absent</label><select id="tm-'+esc(i.name)+'"><option value="pause_notify" '+(i.torrent_missing_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="continue_notify" '+(i.torrent_missing_action==='continue_notify'?'selected':'')+'>▶ Continuer + notifier Discord</option><option value="pause_decision" '+(i.torrent_missing_action==='pause_decision'?'selected':'')+'>❓ Mettre en pause et demander une décision</option></select></div><div class="profile-field"><label>Après scan bibliothèque</label><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div><div class="profile-field"><label>Si Groq recommande NÉCESSAIRE</label><select id="ain-'+esc(i.name)+'"><option value="pause_notify" '+(i.ai_necessary_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue_notify" '+(i.ai_necessary_action==='continue_notify'?'selected':'')+'>▶ Continuer + notifier Discord</option><option value="pause_decision" '+(i.ai_necessary_action==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option></select></div><div class="profile-field"><label>Si Groq recommande NON NÉCESSAIRE</label><select id="ainno-'+esc(i.name)+'"><option value="pause_notify" '+(i.ai_not_necessary_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue_notify" '+(i.ai_not_necessary_action==='continue_notify'?'selected':'')+'>▶ Continuer + notifier Discord</option><option value="pause_decision" '+(i.ai_not_necessary_action==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option></select></div><div class="profile-field"><label>Si Groq recommande INDETERMINÉ</label><select id="aii-'+esc(i.name)+'"><option value="pause_notify" '+(i.ai_indeterminate_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue_notify" '+(i.ai_indeterminate_action==='continue_notify'?'selected':'')+'>▶ Continuer + notifier Discord</option><option value="pause_decision" '+(i.ai_indeterminate_action==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option></select></div><div class="profile-field"><label>Si erreur d’analyse</label><select id="err-'+esc(i.name)+'" onchange="toggleRetryFields('+JSON.stringify(i.name)+')"><option value="notify_continue" '+(i.error_action==='notify_continue'?'selected':'')+'>▶ Continuer + notifier</option><option value="pause_decision" '+(i.error_action==='pause_decision'?'selected':'')+'>⏸ Pause + demander une décision</option><option value="retry_pause" '+(i.error_action==='retry_pause'?'selected':'')+'>🔄 Réessayer puis mettre en pause</option><option value="retry_continue" '+(i.error_action==='retry_continue'?'selected':'')+'>🔄 Réessayer puis continuer</option></select><div class="retry-fields" id="retry-'+esc(i.name)+'" style="display:'+(i.error_action==='retry_pause'||i.error_action==='retry_continue'?'grid':'none')+'"><label>Nombre de tentatives<input type="number" min="1" max="20" id="retries-'+esc(i.name)+'" value="'+(i.error_retries||5)+'"></label><label>Délai entre tentatives (s)<input type="number" min="1" max="3600" id="delay-'+esc(i.name)+'" value="'+(i.error_retry_delay||30)+'"></label></div></div></div><div class="profile-footer"><label class="setting-item" style="padding:0;border:0;justify-content:flex-start"><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+' style="min-width:0;flex:none"><span>Profil actif</span></label><button type="button" class="primary profile-save" data-profile-name="'+esc(i.name)+'" data-profile-type="'+esc(i.media_type)+'" data-forced-required="'+(i.forced_required?'1':'0')+'">💾 Enregistrer</button></div></div>').join('');document.querySelectorAll('.profile-save').forEach(b=>b.addEventListener('click',()=>saveProfile(b.dataset.profileName,b.dataset.profileType,b.dataset.forcedRequired==='1')))}
+async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value='';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value='';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value='';$('cfgDiscordToken').value='';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value='';$('cfgTZ').value=c.values.TZ||'';$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';loadQbTags();$('profiles').innerHTML=p.results.map(i=>'<div class="profile-card"><div class="profile-top"><div><div class="profile-name">'+esc(i.media_type==='Film'?'🎬 Films':'📺 Séries')+'</div><div class="profile-type">Règles appliquées aux analyses de ce type de média</div></div><span class="status-pill '+(i.enabled?'on':'off')+'">'+(i.enabled?'● Actif':'○ Inactif')+'</span></div><div class="profile-grid"><div class="profile-field"><label>Si Forced FR trouvé</label><select id="found-'+esc(i.name)+'"><option value="validate" '+(i.found_action==='validate'?'selected':'')+'>✓ Valider</option><option value="pause_notify" '+(i.found_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="validate_notify" '+(i.found_action==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option></select></div><div class="profile-field"><label>Si Forced FR absent</label><select id="tm-'+esc(i.name)+'"><option value="pause_notify" '+(i.torrent_missing_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="continue_notify" '+(i.torrent_missing_action==='continue_notify'?'selected':'')+'>▶ Continuer + notifier Discord</option><option value="pause_decision" '+(i.torrent_missing_action==='pause_decision'?'selected':'')+'>❓ Mettre en pause et demander une décision</option></select></div><div class="profile-field"><label>Après scan bibliothèque</label><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div><div class="profile-field"><label>Si erreur d’analyse</label><select id="err-'+esc(i.name)+'" onchange="toggleRetryFields('+JSON.stringify(i.name)+')"><option value="notify_continue" '+(i.error_action==='notify_continue'?'selected':'')+'>▶ Continuer + notifier</option><option value="pause_decision" '+(i.error_action==='pause_decision'?'selected':'')+'>⏸ Pause + demander une décision</option><option value="retry_pause" '+(i.error_action==='retry_pause'?'selected':'')+'>🔄 Réessayer puis mettre en pause</option><option value="retry_continue" '+(i.error_action==='retry_continue'?'selected':'')+'>🔄 Réessayer puis continuer</option></select><div class="retry-fields" id="retry-'+esc(i.name)+'" style="display:'+(i.error_action==='retry_pause'||i.error_action==='retry_continue'?'grid':'none')+'"><label>Nombre de tentatives<input type="number" min="1" max="20" id="retries-'+esc(i.name)+'" value="'+(i.error_retries||5)+'"></label><label>Délai entre tentatives (s)<input type="number" min="1" max="3600" id="delay-'+esc(i.name)+'" value="'+(i.error_retry_delay||30)+'"></label></div></div></div><div class="profile-footer"><label class="setting-item" style="padding:0;border:0;justify-content:flex-start"><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+' style="min-width:0;flex:none"><span>Profil actif</span></label><button type="button" class="primary profile-save" data-profile-name="'+esc(i.name)+'" data-profile-type="'+esc(i.media_type)+'" data-forced-required="'+(i.forced_required?'1':'0')+'">💾 Enregistrer</button></div></div>').join('');document.querySelectorAll('.profile-save').forEach(b=>b.addEventListener('click',()=>saveProfile(b.dataset.profileName,b.dataset.profileType,b.dataset.forcedRequired==='1')))}
 function toggleRetryFields(name){const v=$('err-'+name).value;const box=$('retry-'+name);if(box)box.style.display=(v==='retry_pause'||v==='retry_continue')?'grid':'none'}
-async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,found_action:$('found-'+name).value,torrent_missing_action:$('tm-'+name).value,error_action:$('err-'+name).value,error_retries:parseInt($('retries-'+name)?.value||5,10),error_retry_delay:parseFloat($('delay-'+name)?.value||30),ai_necessary_action:$('ain-'+name).value,ai_not_necessary_action:$('ainno-'+name).value,ai_indeterminate_action:$('aii-'+name).value,enabled:$('ena-'+name).checked})});alert('Profil enregistré.')}catch(e){alert(e.message)}}
+async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,found_action:$('found-'+name).value,torrent_missing_action:$('tm-'+name).value,error_action:$('err-'+name).value,error_retries:parseInt($('retries-'+name)?.value||5,10),error_retry_delay:parseFloat($('delay-'+name)?.value||30),enabled:$('ena-'+name).checked})});alert('Profil enregistré.')}catch(e){alert(e.message)}}
 async function testConnection(kind){const el=$('test-'+kind);el.className='test-result warn';el.textContent='Test en cours…';try{const d=await api('/test/'+kind,{method:'POST'});el.className='test-result '+(d.ok?'ok':'bad');el.textContent=(d.ok?'✓ ':'✕ ')+d.message}catch(e){el.className='test-result bad';el.textContent='✕ '+e.message}}
 async function loadQbTags(){try{const d=await api('/qbittorrent/tags');const box=$('qbTagsAvailable');if(!box)return;if(!d.results.length){box.innerHTML='<span class="small">Aucune étiquette trouvée dans qBittorrent.</span>';return}box.innerHTML=d.results.map(t=>'<button type="button" class="tag-chip" data-qb-tag="'+esc(t)+'">'+esc(t)+'</button>').join('');box.querySelectorAll('.tag-chip').forEach(b=>b.addEventListener('click',()=>addIgnoredTag(b.dataset.qbTag,b)))}catch(e){const box=$('qbTagsAvailable');if(box)box.innerHTML='<span class="small warn">Impossible de récupérer les étiquettes qBittorrent.</span>'}}
 function addIgnoredTag(tag,button){const input=$('cfgQBIgnoredTags');const current=input.value.split(',').map(x=>x.trim()).filter(Boolean);const exists=current.some(x=>x.toLowerCase()===tag.toLowerCase());if(!exists){current.push(tag);input.value=current.join(', ')}if(button){button.classList.toggle('selected',true);button.title='Étiquette déjà sélectionnée';}}
 
-async function saveConnectionSettings(){try{const payload={QB_HOST:$('cfgQBHost').value,QB_USERNAME:$('cfgQBUsername').value,QB_PASSWORD:$('cfgQBPassword').value,RADARR_URL:$('cfgRadarrUrl').value,RADARR_API_KEY:$('cfgRadarrKey').value,SONARR_URL:$('cfgSonarrUrl').value,SONARR_API_KEY:$('cfgSonarrKey').value,DISCORD_BOT_TOKEN:$('cfgDiscordToken').value,DISCORD_CHANNEL_ID:$('cfgDiscordChannel').value,DISCORD_WEBHOOK_URL:$('cfgDiscordWebhook').value,TZ:$('cfgTZ').value,GROQ_MODEL:$('cfgGroqModel').value,GROQ_API_KEY:$('cfgGroqKey').value,BRAVE_SEARCH_API_KEY:$('cfgBraveKey').value};await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qb_ignored_tags:$('cfgQBIgnoredTags').value,ai_enabled:$('cfgAIEnabled').checked,brave_results_count:parseInt($('cfgBraveCount').value||5,10)})});alert('Connexions enregistrées.');refresh()}catch(e){alert(e.message)}}
-async function testAIConfig(){try{const r=await api('/ai/test',{method:'POST'});if(!r.ok)throw new Error(r.message||'Test IA échoué');alert('Test réussi : Brave '+r.brave_results+' résultat(s), Groq '+(r.groq?.recommendation||'OK'))}catch(e){alert(e.message)}}
+async function saveConnectionSettings(){try{const payload={QB_HOST:$('cfgQBHost').value,QB_USERNAME:$('cfgQBUsername').value,QB_PASSWORD:$('cfgQBPassword').value,RADARR_URL:$('cfgRadarrUrl').value,RADARR_API_KEY:$('cfgRadarrKey').value,SONARR_URL:$('cfgSonarrUrl').value,SONARR_API_KEY:$('cfgSonarrKey').value,DISCORD_BOT_TOKEN:$('cfgDiscordToken').value,DISCORD_CHANNEL_ID:$('cfgDiscordChannel').value,DISCORD_WEBHOOK_URL:$('cfgDiscordWebhook').value,TZ:$('cfgTZ').value};await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Connexions enregistrées.');refresh()}catch(e){alert(e.message)}}
 async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked,qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
 $('historyFilter').onchange=renderHistory;$('historySearch').oninput=renderHistory;
 async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}(async()=>{try{await loadCached('all')}catch(e){console.error(e)}loadDashboard();refresh()})();
@@ -3490,7 +3560,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.6.3",
+        "version": "2.6.5",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -3601,6 +3671,7 @@ def configuration() -> dict[str, Any]:
             values[key] = value
     return {"values": values, "configured": configured}
 
+
 @app.post("/configuration")
 def update_configuration(payload: dict[str, Any]) -> dict[str, Any]:
     global DISCORD_BOT_TOKEN, DISCORD_CHANNEL_ID, DISCORD_WEBHOOK_URL, QB_HOST, QB_PASSWORD, QB_USERNAME
@@ -3614,6 +3685,8 @@ def update_configuration(payload: dict[str, Any]) -> dict[str, Any]:
     load_runtime_configuration()
     return configuration()
 
+
+
 @app.post("/ai/test")
 def ai_test() -> dict[str, Any]:
     title="ForcedFR test"
@@ -3623,7 +3696,6 @@ def ai_test() -> dict[str, Any]:
         return {"ok":True,"brave_results":len(sources),"groq":result}
     except Exception as exc:
         return {"ok":False,"message":str(exc)}
-
 
 @app.get("/qbittorrent/tags")
 def qbittorrent_tags() -> dict[str, Any]:
@@ -3641,6 +3713,7 @@ def settings() -> dict[str, Any]:
     }
 
 
+
 @app.post("/settings")
 def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if "notify_no_forced" in payload:
@@ -3655,6 +3728,7 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if "brave_results_count" in payload:
         set_setting("brave_results_count", str(max(1, min(10, int(payload.get("brave_results_count") or 5)))))
     return settings()
+
 
 
 @app.get("/profiles")
@@ -3679,6 +3753,7 @@ def update_profile(payload: dict[str, Any]) -> dict[str, Any]:
             ON CONFLICT(name) DO UPDATE SET media_type=excluded.media_type,forced_required=excluded.forced_required,missing_action=excluded.missing_action,error_action=excluded.error_action,enabled=excluded.enabled,updated_at=excluded.updated_at,error_retries=excluded.error_retries,error_retry_delay=excluded.error_retry_delay,found_action=excluded.found_action,torrent_missing_action=excluded.torrent_missing_action,ai_necessary_action=excluded.ai_necessary_action,ai_not_necessary_action=excluded.ai_not_necessary_action,ai_indeterminate_action=excluded.ai_indeterminate_action
         """, (name,media_type,int(bool(payload.get("forced_required",True))),str(payload.get("missing_action") or "review"),str(payload.get("error_action") or "notify_continue"),int(bool(payload.get("enabled",True))),time.time(),max(1,min(20,int(payload.get("error_retries") or 5))),max(1.0,min(3600.0,float(payload.get("error_retry_delay") or 30))),str(payload.get("found_action") or "validate"),str(payload.get("torrent_missing_action") or "pause_notify"),str(payload.get("ai_necessary_action") or "pause_notify"),str(payload.get("ai_not_necessary_action") or "continue_notify"),str(payload.get("ai_indeterminate_action") or "pause_decision")))
     return {"ok": True}
+
 
 
 @app.get("/history")
