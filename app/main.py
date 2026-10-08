@@ -103,7 +103,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.6.5",
+    version="2.6.6",
 )
 
 
@@ -460,6 +460,19 @@ def arr_history_lookup(
             item_id,
         )
 
+        poster_url = None
+        try:
+            endpoint = f"{base_url}/api/v3/movie/{item_id}" if source == "Radarr" else f"{base_url}/api/v3/series/{item_id}"
+            item_response = requests.get(endpoint, headers={"X-Api-Key": api_key}, timeout=10)
+            item_response.raise_for_status()
+            item_json = item_response.json() or {}
+            images = item_json.get("images") or []
+            poster = next((x for x in images if str(x.get("coverType") or "").lower() == "poster"), None)
+            if poster:
+                poster_url = poster.get("remoteUrl") or poster.get("url")
+        except Exception:
+            poster_url = None
+
         return {
             "source": source,
             "title": grabbed.get("sourceTitle"),
@@ -470,6 +483,7 @@ def arr_history_lookup(
             ),
             "arr_item_url": arr_item_url,
             "item_id": item_id,
+            "poster_url": poster_url,
             "event_type": grabbed.get("eventType"),
         }
 
@@ -516,6 +530,7 @@ def get_release_context(
         "tracker_url": None,
         "arr_item_url": None,
         "item_id": None,
+        "poster_url": None,
         "event_type": None,
     }
 
@@ -604,7 +619,14 @@ async def _send_discord_bot_message(
     if channel is None:
         channel = await discord_bot.fetch_channel(int(DISCORD_CHANNEL_ID))
 
-    embed_objects = [discord.Embed.from_dict(embed) for embed in embeds]
+    enriched_embeds = []
+    poster_url = str(release.get("poster_url") or "").strip() if release else ""
+    for embed in embeds:
+        item = dict(embed)
+        if poster_url and not item.get("image"):
+            item["image"] = {"url": poster_url}
+        enriched_embeds.append(item)
+    embed_objects = [discord.Embed.from_dict(embed) for embed in enriched_embeds]
     view = ForcedFRView(torrent_hash, release)
     await channel.send(embeds=embed_objects, view=view)
 
@@ -1030,7 +1052,10 @@ def notify_profile_decision(torrent: dict[str, Any], title: str, description: st
         update_torrent_release_context(torrent_hash, release)
     fields = build_release_fields(torrent, release)
     fields.append({"name": "Action ForcedFR", "value": action_text, "inline": False})
-    send_discord_message(embeds=[{"title": title, "description": description, "color": 5763719, "fields": fields, "footer": {"text": "ForcedFR • Notification"}}], torrent_hash=torrent_hash, release=release)
+    embed = {"title": title, "description": description, "color": 5763719, "fields": fields, "footer": {"text": "ForcedFR • Notification"}}
+    if release.get("poster_url"):
+        embed["image"] = {"url": str(release["poster_url"])}
+    send_discord_message(embeds=[embed], torrent_hash=torrent_hash, release=release)
 
 
 def notify_analysis_error(torrent: dict[str, Any], error: str, *, action_text: str, attempt: int | None = None, release: dict[str, Any] | None = None) -> None:
@@ -1680,8 +1705,8 @@ def _groq_generate(media_type: str, title: str, search_results: list[dict[str,st
     raise RuntimeError(f"Groq indisponible après {AI_RETRIES} tentative(s): {last}")
 
 
-def research_forced_fr_with_ai(torrent: dict[str,Any], media_type: str, title: str, ffprobe_result: dict[str,Any] | None = None) -> dict[str,Any]:
-    cached=_ai_cache_get(media_type,title)
+def research_forced_fr_with_ai(torrent: dict[str,Any], media_type: str, title: str, ffprobe_result: dict[str,Any] | None = None, ignore_cache: bool = False) -> dict[str,Any]:
+    cached=None if ignore_cache else _ai_cache_get(media_type,title)
     if cached:
         log.info("[%s] 🤖 Décision IA récupérée depuis le cache : %s",torrent.get("hash",""),cached.get("recommendation"))
         return cached
@@ -1695,6 +1720,28 @@ def research_forced_fr_with_ai(torrent: dict[str,Any], media_type: str, title: s
     _ai_cache_put(media_type,title,result)
     log.info("[%s] 🤖 Groq : %s (confiance %.0f%%).",torrent.get("hash",""),result.get("recommendation"),float(result.get("confidence") or 0)*100)
     return result
+
+
+def _ai_confidence_threshold_key(media_type: str, decision: str) -> str | None:
+    if decision not in {"NÉCESSAIRE", "NON NÉCESSAIRE"}:
+        return None
+    suffix = "series" if media_type == "Série" else "films"
+    prefix = "ai_necessary_min_confidence" if decision == "NÉCESSAIRE" else "ai_not_necessary_min_confidence"
+    return f"{prefix}_{suffix}"
+
+
+def _normalize_ai_decision(media_type: str, result: dict[str, Any]) -> tuple[str, float, bool]:
+    decision = str(result.get("recommendation") or "INDETERMINÉ").strip().upper()
+    if decision not in {"NÉCESSAIRE", "NON NÉCESSAIRE", "INDETERMINÉ"}:
+        decision = "INDETERMINÉ"
+    confidence = max(0.0, min(1.0, float(result.get("confidence") or 0)))
+    key = _ai_confidence_threshold_key(media_type, decision)
+    if key:
+        threshold = max(0.0, min(100.0, float(_setting(key, "70") or 70))) / 100.0
+        if confidence < threshold:
+            log.info("Décision IA %s convertie en INDETERMINÉ : confiance %.0f%% < seuil %.0f%%.", decision, confidence*100, threshold*100)
+            return "INDETERMINÉ", confidence, False
+    return decision, confidence, True
 
 
 def _apply_ai_action(torrent: dict[str,Any], profile: dict[str,Any], decision: str, ai_result: dict[str,Any], release: dict[str,Any] | None) -> str:
@@ -1914,9 +1961,9 @@ def process_new_torrent(
 
                 try:
                     ai_result = research_forced_fr_with_ai(torrent, media_type, name, result)
-                    decision = str(ai_result.get("recommendation") or "INDETERMINÉ").upper()
-                    if decision not in {"NÉCESSAIRE", "NON NÉCESSAIRE", "INDETERMINÉ"}:
-                        decision = "INDETERMINÉ"
+                    decision, normalized_confidence, accepted = _normalize_ai_decision(media_type, ai_result)
+                    ai_result["effective_recommendation"] = decision
+                    ai_result["confidence"] = normalized_confidence
                     action_text = _apply_ai_action(torrent, profile, decision, ai_result, release)
                     record_analysis_history(torrent_hash, name, "no_forced", f"🤖 {decision} — {action_text}")
                 except Exception as ai_exc:
@@ -2617,6 +2664,10 @@ def init_database() -> None:
             "qb_ignored_tags": "",
             "ai_enabled": "1",
             "brave_results_count": "5",
+            "ai_necessary_min_confidence_films": "70",
+            "ai_not_necessary_min_confidence_films": "70",
+            "ai_necessary_min_confidence_series": "70",
+            "ai_not_necessary_min_confidence_series": "70",
         }
         for key, value in defaults.items():
             conn.execute(
@@ -3255,6 +3306,11 @@ def get_cached_library_results(scope: str) -> list[dict[str, Any]]:
             cached = None
         if cached is None:
             continue
+        ai_cached = _ai_cache_get(str(item.get("type", "Film")), str(item.get("title") or Path(file_path).stem))
+        ai_decision = None
+        ai_confidence = None
+        if ai_cached:
+            ai_decision, ai_confidence, _ = _normalize_ai_decision(str(item.get("type", "Film")), ai_cached)
         results.append({
             "path": str(file_path),
             "relative_path": item.get("raw_path") or item.get("title"),
@@ -3277,6 +3333,9 @@ def get_cached_library_results(scope: str) -> list[dict[str, Any]]:
             "reviewed_at": cached.get("reviewed_at"),
             "review_note": cached.get("review_note"),
             "from_cache": True,
+            "ai_recommendation": ai_decision,
+            "ai_confidence": ai_confidence,
+            "ai_analyzed": bool(ai_cached),
         })
     return results
 
@@ -3450,7 +3509,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.6.5</title>
+<title>ForcedFR v2.6.6</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -3466,7 +3525,7 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 .settings-grid{display:grid;grid-template-columns:minmax(290px,.8fr) minmax(0,1.5fr);gap:18px;align-items:start}.settings-card{padding:19px}.settings-card h3{margin:0 0 6px}.settings-card .desc{color:var(--muted);font-size:.84rem;line-height:1.5;margin:0 0 16px}.setting-item{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:14px 0;border-top:1px solid var(--border)}.setting-item:first-of-type{border-top:0}.setting-copy strong{display:block;font-size:.85rem}.setting-copy span{display:block;color:var(--muted);font-size:.76rem;margin-top:4px}.switch{position:relative;width:44px;height:24px;flex:0 0 auto}.switch input{display:none}.switch span{position:absolute;inset:0;background:#2b3542;border-radius:999px;cursor:pointer;transition:.2s}.switch span:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.switch input:checked+span{background:var(--green)}.switch input:checked+span:before{transform:translateX(20px)}.savebar{display:flex;justify-content:flex-end;margin-top:17px}.profile-list{display:grid;gap:12px}.profile-card{background:rgba(21,29,39,.76);border:1px solid var(--border);border-radius:13px;padding:17px}.profile-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.profile-name{font-size:.98rem;font-weight:850}.profile-type{color:var(--muted);font-size:.76rem;margin-top:3px}.profile-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.profile-field{display:flex;flex-direction:column;gap:7px}.profile-field label{color:var(--muted);font-size:.68rem;text-transform:uppercase;font-weight:800;letter-spacing:.05em}.profile-field select{width:100%;min-width:0}.profile-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:15px;padding-top:14px;border-top:1px solid var(--border)}.status-pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;background:#202a36;font-size:.72rem;font-weight:800}.status-pill.on{color:var(--green)}.status-pill.off{color:var(--muted)}.settings-title{margin-top:0;margin-bottom:12px}.settings-title h2{margin-bottom:4px}.settings-title p{margin:0}.tag-list{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.tag-chip{border:1px solid var(--border);background:#202a36;color:#e8edf2;border-radius:999px;padding:6px 10px;cursor:pointer;font-size:.75rem}.tag-chip:hover{border-color:var(--accent)}.tag-chip.selected{background:rgba(72,184,128,.14);border-color:var(--green);color:#fff;box-shadow:0 0 0 1px rgba(72,184,128,.12) inset}.retry-fields{grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}.retry-fields label{font-size:.68rem;color:var(--muted);text-transform:uppercase;font-weight:800}.retry-fields input{margin-top:5px}
 @media(max-width:1000px){.services{grid-template-columns:repeat(3,1fr)}.settings-grid{grid-template-columns:1fr}.profile-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:720px){main{padding:22px 15px 40px}.services{grid-template-columns:1fr 1fr}.app-header{align-items:flex-start}.tabs{overflow:auto;flex-wrap:nowrap}.tab{white-space:nowrap}.activity-row{grid-template-columns:1fr;gap:5px}.profile-grid{grid-template-columns:1fr 1fr}.profile-footer{align-items:flex-start;flex-direction:column}.savebar{justify-content:stretch}.savebar button{width:100%}.media-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){.services{grid-template-columns:1fr}.profile-grid{grid-template-columns:1fr}.version{display:none}.media-grid{grid-template-columns:1fr 1fr}}
 </style></head><body><main>
-<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.6.5</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.6.6</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="services">
 <div class="service-card"><div class="service-icon">✓</div><div><div class="service-name">ForcedFR</div><div class="service-meta"><span class="status-dot online"></span> Service actif</div></div></div>
 <div class="service-card"><div class="service-icon"><img src="https://cdn.simpleicons.org/qbittorrent" alt="qBittorrent"></div><div><div class="service-name">qBittorrent</div><div class="service-meta value" id="qb">…</div></div></div>
@@ -3482,7 +3541,7 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 </section>
 
 <section id="p-scan" class="panel">
-<div class="card"><div class="toolbar"><button onclick="startScan('films','incremental')">⚡ Films incrémental</button><button onclick="startScan('films','full')">🎬 Films complet</button><button onclick="startScan('series','incremental')">⚡ Séries incrémental</button><button onclick="startScan('series','full')">📺 Séries complet</button><button onclick="startScan('all','incremental')">⚡ Toute la bibliothèque</button></div><div class="small" id="scanLabel">Aucun scan en cours.</div><div class="progress"><div id="bar"></div></div><div class="small" id="stats"></div></div>
+<div class="card"><div class="toolbar"><button onclick="startScan('films','incremental')">⚡ Films incrémental</button><button onclick="startLibraryAI('films',false)">🤖 IA Films sans Forced FR</button><button onclick="startLibraryAI('films',true)">🔄 Réexaminer Films IA</button><button onclick="startScan('films','full')">🎬 Films complet</button><button onclick="startScan('series','incremental')">⚡ Séries incrémental</button><button onclick="startLibraryAI('series',false)">🤖 IA Séries sans Forced FR</button><button onclick="startLibraryAI('series',true)">🔄 Réexaminer Séries IA</button><button onclick="startScan('series','full')">📺 Séries complet</button><button onclick="startScan('all','incremental')">⚡ Toute la bibliothèque</button></div><div class="small" id="scanLabel">Aucun scan en cours.</div><div class="progress"><div id="bar"></div></div><div class="small" id="stats"></div></div>
 <div class="subtabs"><button class="subtab active" data-kind="films">🎬 Films</button><button class="subtab" data-kind="series">📺 Séries</button></div>
 <div id="k-films"><div class="section-head"><div><h2>Films</h2><p class="sub">Les films déjà analysés sont affichés immédiatement. Un scan incrémental est lancé à l'ouverture.</p></div></div><div class="filters"><select id="ff"><option value="all">Tous</option><option value="yes">Avec Forced FR</option><option value="no">Sans Forced FR</option><option value="error">Erreurs</option><option value="pending">🔴 À traiter</option><option value="validated">🟢 Absence normale</option><option value="waiting">🟠 En attente</option></select><input id="fs" placeholder="Rechercher un film…"></div><div id="films" class="media-grid"></div></div>
 <div id="k-series" style="display:none"><div class="section-head"><div><h2>Séries</h2><p class="sub">Une carte par série. Clique sur une série pour afficher ses épisodes.</p></div></div><div class="filters"><select id="sf"><option value="all">Toutes</option><option value="yes">Avec Forced FR</option><option value="no">Sans Forced FR</option><option value="error">Erreurs</option><option value="pending">🔴 À traiter</option><option value="validated">🟢 Absence normale</option><option value="waiting">🟠 En attente</option></select><input id="ss" placeholder="Rechercher une série…"></div><div id="seriesGrid" class="media-grid"><div id="series" style="display:contents"></div></div><div id="seriesDetail" class="series-detail"></div></div>
@@ -3491,18 +3550,36 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 <section id="p-errors" class="panel"><h2>Erreurs à traiter</h2><p class="sub">Erreurs persistantes du scan de bibliothèque. Une réussite lors d'un prochain scan les clôture automatiquement.</p><div class="toolbar"><button onclick="startScan('films','incremental')">↻ Relancer Films</button><button onclick="startScan('series','incremental')">↻ Relancer Séries</button><button onclick="startScan('all','incremental')">↻ Relancer toute la bibliothèque</button></div><div class="tablewrap" style="margin-top:14px"><table><thead><tr><th>Dernière détection</th><th>Média</th><th>Erreur</th><th>Action</th></tr></thead><tbody id="errors"></tbody></table></div></section>
 
 <section id="p-settings" class="panel">
-<div class="section-head"><div><h2>Paramètres</h2><p class="sub">Toutes les connexions de ForcedFR sont configurables ici. Les paramètres sont conservés dans SQLite et survivent aux redémarrages. Les secrets sont masqués.</p></div></div>
+<div class="settings-title"><h2>⚙ Paramètres ForcedFR</h2><p class="sub">Une seule page pour les connexions, l’intelligence artificielle et les règles Films / Séries.</p></div>
 <div class="settings-grid">
-<div class="settings-card"><h3>🔌 Connexions</h3><p class="desc">Configure qBittorrent, Radarr, Sonarr et Discord sans modifier Docker.</p>
-<div class="config-group"><h4>qBittorrent</h4><label class="config-field"><span>Adresse</span><input id="cfgQBHost"></label><label class="config-field"><span>Utilisateur</span><input id="cfgQBUsername"></label><label class="config-field"><span>Mot de passe</span><input id="cfgQBPassword" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('qbittorrent')">Tester la connexion</button><div id="test-qbittorrent" class="test-result"></div></div>
-<div class="config-group"><h4>Radarr</h4><label class="config-field"><span>Adresse</span><input id="cfgRadarrUrl"></label><label class="config-field"><span>Clé API</span><input id="cfgRadarrKey" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('radarr')">Tester la connexion</button><div id="test-radarr" class="test-result"></div></div>
-<div class="config-group"><h4>Sonarr</h4><label class="config-field"><span>Adresse</span><input id="cfgSonarrUrl"></label><label class="config-field"><span>Clé API</span><input id="cfgSonarrKey" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('sonarr')">Tester la connexion</button><div id="test-sonarr" class="test-result"></div></div>
-<div class="config-group"><h4>Discord</h4><label class="config-field"><span>Token du bot</span><input id="cfgDiscordToken" type="password" placeholder="Laisser vide pour conserver"></label><label class="config-field"><span>ID du salon</span><input id="cfgDiscordChannel"></label><label class="config-field"><span>Webhook URL</span><input id="cfgDiscordWebhook" type="password" placeholder="Laisser vide pour conserver"></label><button class="test-btn" onclick="testConnection('discord')">Tester le bot Discord</button><div id="test-discord" class="test-result"></div></div>
-<div class="config-group"><h4>Environnement</h4><label class="config-field"><span>Fuseau horaire</span><input id="cfgTZ" placeholder="Europe/Paris"></label></div>
-<div class="savebar"><button class="primary" onclick="saveConnectionSettings()">💾 Enregistrer les connexions</button></div><div class="small config-note">Les paramètres sont enregistrés dans SQLite. Les connexions qBittorrent / Radarr / Sonarr sont actualisées immédiatement. Un redémarrage est nécessaire après changement du token du bot Discord. Pour tester une connexion, enregistre d’abord les paramètres.</div>
+<div>
+<div class="settings-card"><h3>🤖 Intelligence artificielle</h3><p class="desc">Brave effectue la recherche Web. Groq analyse les sources et fournit la décision.</p>
+<div class="setting-item"><div class="setting-copy"><strong>Activer l’analyse IA</strong><span>Si désactivée, ForcedFR utilise uniquement le comportement classique.</span></div><label class="switch"><input type="checkbox" id="setAIEnabled"><span></span></label></div>
+<label class="config-field"><span>Clé API Groq</span><input id="cfgGroqKey" autocomplete="off"></label>
+<label class="config-field"><span>Modèle Groq</span><input id="cfgGroqModel"></label>
+<div class="savebar"><button class="primary" onclick="testConnection('groq')">🧪 Tester Groq</button><span id="test-groq" class="test-result"></span></div>
+<label class="config-field"><span>Clé API Brave Search</span><input id="cfgBraveKey" autocomplete="off"></label>
+<label class="config-field"><span>Nombre de résultats Web</span><input id="cfgBraveResults" type="number" min="1" max="10"></label>
+<div class="savebar"><button class="primary" onclick="testConnection('brave')">🧪 Tester Brave</button><span id="test-brave" class="test-result"></span></div>
 </div>
-<div><div class="settings-card"><h3>🏷️ Étiquettes qBittorrent ignorées</h3><p class="desc">Les torrents portant l’une de ces étiquettes ne seront pas analysés par ForcedFR.</p><label class="config-field"><span>Étiquettes ignorées</span><input id="cfgQBIgnoredTags" placeholder="cross-seed, autre-etiquette"></label><div class="small" style="margin-top:10px">Étiquettes actuellement disponibles dans qBittorrent :</div><div id="qbTagsAvailable" class="tag-list"></div><div class="config-note">Clique sur une étiquette pour l’ajouter. Tu peux aussi en saisir plusieurs manuellement.</div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les étiquettes</button></div></div><div class="settings-card" style="margin-top:18px"><h3>🔔 Notifications</h3><p class="desc">Choisis les événements qui doivent générer une notification.</p><div class="setting-item"><div class="setting-copy"><strong>Forced FR absent</strong><span>Notifier lorsqu'un torrent est mis en pause.</span></div><label class="switch"><input type="checkbox" id="setNoForced"><span></span></label></div><div class="setting-item"><div class="setting-copy"><strong>Erreur d'analyse</strong><span>Notifier lorsqu'une analyse FFprobe échoue.</span></div><label class="switch"><input type="checkbox" id="setErrors"><span></span></label></div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer les notifications</button></div></div><div class="settings-title" style="margin-top:22px"><h2>Profils d'analyse</h2><p class="sub">Règles séparées pour les Films et les Séries.</p></div><div id="profiles" class="profile-list"></div></div>
-</div></section>
+<div class="settings-card" style="margin-top:18px"><h3>🎯 Confiance IA</h3><p class="desc">Si Groq propose NÉCESSAIRE ou NON NÉCESSAIRE sous le seuil choisi, ForcedFR transforme automatiquement la décision en INDETERMINÉ. INDETERMINÉ n’a pas de seuil.</p>
+<div class="profile-card"><div class="profile-name">🎬 Films</div><div class="profile-grid"><label class="profile-field"><span>🟢 NÉCESSAIRE — confiance minimale (%)</span><input id="confFilmsNecessary" type="number" min="0" max="100"></label><label class="profile-field"><span>🔵 NON NÉCESSAIRE — confiance minimale (%)</span><input id="confFilmsNotNecessary" type="number" min="0" max="100"></label></div></div>
+<div class="profile-card" style="margin-top:12px"><div class="profile-name">📺 Séries</div><div class="profile-grid"><label class="profile-field"><span>🟢 NÉCESSAIRE — confiance minimale (%)</span><input id="confSeriesNecessary" type="number" min="0" max="100"></label><label class="profile-field"><span>🔵 NON NÉCESSAIRE — confiance minimale (%)</span><input id="confSeriesNotNecessary" type="number" min="0" max="100"></label></div></div>
+<div class="savebar"><button class="primary" onclick="saveAISettings()">💾 Enregistrer l’IA</button></div></div>
+<div class="settings-card" style="margin-top:18px"><h3>🔔 Notifications</h3><div class="setting-item"><div class="setting-copy"><strong>Forced FR absent</strong><span>Notifier les décisions / absences de Forced FR.</span></div><label class="switch"><input type="checkbox" id="setNoForced"><span></span></label></div><div class="setting-item"><div class="setting-copy"><strong>Erreur d’analyse</strong><span>Notifier les erreurs FFprobe ou IA.</span></div><label class="switch"><input type="checkbox" id="setErrors"><span></span></label></div></div>
+</div>
+<div>
+<div class="settings-card"><h3>🎬 Profil Films</h3><p class="desc">Chaque décision IA possède sa propre action.</p><div id="profileFilm"></div></div>
+<div class="settings-card" style="margin-top:18px"><h3>📺 Profil Séries</h3><p class="desc">Les règles des séries sont totalement indépendantes des films.</p><div id="profileSeries"></div></div>
+<div class="settings-card" style="margin-top:18px"><h3>⚠️ En cas d’erreur d’analyse</h3><p class="desc">Le comportement reste configurable séparément dans chaque profil.</p><div id="profileErrors"></div></div>
+<div class="settings-card" style="margin-top:18px"><h3>🔌 Connexions</h3><p class="desc">Toutes les valeurs sont affichées en clair, comme demandé.</p>
+<label class="config-field"><span>qBittorrent</span><input id="cfgQBHost"></label><label class="config-field"><span>Utilisateur qBittorrent</span><input id="cfgQBUsername"></label><label class="config-field"><span>Mot de passe qBittorrent</span><input id="cfgQBPassword"></label>
+<label class="config-field"><span>Radarr URL</span><input id="cfgRadarrUrl"></label><label class="config-field"><span>Radarr API Key</span><input id="cfgRadarrKey"></label>
+<label class="config-field"><span>Sonarr URL</span><input id="cfgSonarrUrl"></label><label class="config-field"><span>Sonarr API Key</span><input id="cfgSonarrKey"></label>
+<label class="config-field"><span>Discord Bot Token</span><input id="cfgDiscordToken"></label><label class="config-field"><span>ID du salon Discord</span><input id="cfgDiscordChannel"></label><label class="config-field"><span>Discord Webhook URL</span><input id="cfgDiscordWebhook"></label><label class="config-field"><span>Fuseau horaire</span><input id="cfgTZ"></label>
+<div class="savebar"><button class="primary" onclick="saveConnectionSettings()">💾 Enregistrer les connexions</button></div></div>
+<div class="settings-card" style="margin-top:18px"><h3>🏷️ Étiquettes qBittorrent ignorées</h3><p class="desc">Les torrents portant ces étiquettes ne sont pas analysés.</p><input id="cfgQBIgnoredTags" placeholder="cross-seed, autre-etiquette"><div class="small" style="margin-top:10px">Étiquettes disponibles :</div><div id="qbTagsAvailable" class="tag-list"></div><div class="savebar"><button class="primary" onclick="saveSettings()">💾 Enregistrer</button></div></div>
+</div></div></section>
 
 <section id="p-history" class="panel"><h2>Historique des analyses</h2><p class="sub">Historique persistant des analyses et décisions prises sur les téléchargements.</p><div class="filters"><select id="historyFilter"><option value="all">Toutes les analyses</option><option value="forced_found">Forced FR détecté</option><option value="no_forced">Pas de Forced FR</option><option value="error">Erreurs</option></select><input id="historySearch" placeholder="Rechercher un torrent…"></div>
 <div class="tablewrap"><table><thead><tr><th>Date</th><th>Torrent</th><th>Résultat</th><th>Décision</th><th>Action</th></tr></thead><tbody id="history"></tbody></table></div></section>
@@ -3514,17 +3591,15 @@ function esc(v){return String(v??'').replace(/[&<>\"']/g,c=>({'&':'&amp;','<':'&
 function st(id,s,e=''){const m={connected:['● Connecté','ok'],connecting:['● Connexion…','warn'],disabled:['● Désactivé','warn'],error:['● Indisponible','bad'],not_configured:['● Non configuré','warn'],unknown:['● Inconnu','warn']}[s]||['● '+s,'warn'];$(id).textContent=m[0]+(e?' '+e:'');$(id).className='value '+m[1]}
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));$('p-'+b.dataset.tab).classList.add('active');if(b.dataset.tab==='history')loadHistory();if(b.dataset.tab==='dashboard')loadDashboard();if(b.dataset.tab==='errors')loadErrors();if(b.dataset.tab==='settings')loadSettings();if(b.dataset.tab==='scan'){loadCached('all').then(()=>startScan(document.querySelector('.subtab.active')?.dataset.kind||'films','incremental'))}});
 document.querySelectorAll('.subtab').forEach(b=>b.onclick=async()=>{document.querySelectorAll('.subtab').forEach(x=>x.classList.toggle('active',x===b));['films','series'].forEach(k=>$('k-'+k).style.display=k===b.dataset.kind?'block':'none');$('seriesDetail').classList.remove('active');$('seriesGrid').style.display='grid';await loadCached(b.dataset.kind);await startScan(b.dataset.kind,'incremental')});
+async function analyzeLibraryAI(key,force=false){try{const d=await api('/library/ai',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({media_key:key,force})});const r=d.result||{};const i=data.find(x=>x.media_key===key);if(i){i.ai_analyzed=true;i.ai_recommendation=r.recommendation;i.ai_confidence=r.confidence}render('films');render('series');alert('IA : '+(r.recommendation||'INDETERMINÉ')+' — '+Math.round((r.confidence||0)*100)+'%')}catch(e){alert(e.message)}}
+async function startLibraryAI(scope,force=false){try{const d=await api('/library/ai/bulk',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({scope,force})});alert(d.message||'Analyse IA lancée.')}catch(e){alert(e.message)}}
 async function startScan(s,m='incremental'){try{await api('/scan/'+s+'?mode='+encodeURIComponent(m),{method:'POST'});loaded=false;refresh()}catch(e){alert(e.message)}}
 function rows(kind){const f=$(kind==='films'?'ff':'sf').value,q=$(kind==='films'?'fs':'ss').value.toLowerCase();return data.filter(i=>(kind==='films'?i.type==='Film':i.type==='Série')).filter(i=>{const rs=i.review_status||'pending';if(f==='all')return true;if(f==='error')return i.status==='error';if(f==='yes')return i.status!=='error'&&i.forced_french;if(f==='no')return i.status!=='error'&&!i.forced_french;if(f==='pending')return i.status!=='error'&&!i.forced_french&&rs==='pending';if(f==='validated')return i.status!=='error'&&!i.forced_french&&rs==='validated';if(f==='waiting')return i.status!=='error'&&!i.forced_french&&rs==='waiting_replacement';return true}).filter(i=>!q||(i.title+' '+(i.season||'')+' '+(i.episode||'')).toLowerCase().includes(q))}
 function badge(i){return i.status==='error'?'<span class="badge err">⚠ Erreur</span>':i.forced_french?'<span class="badge yes">✅ Forced FR</span>':'<span class="badge no">❌ Sans Forced FR</span>'}
 function reviewBadge(i){if(i.forced_french||i.status==='error')return '';const m={pending:'<span class="badge no">🔴 À traiter</span>',validated:'<span class="badge yes">🟢 Absence normale</span>',waiting_replacement:'<span class="badge err">🟠 En attente</span>'};return '<div class="small" style="margin-top:6px">'+(m[i.review_status||'pending']||m.pending)+'</div>'}
-function mediaActions(i){let a=[];if(i.arr_url)a.push('<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir '+esc(i.arr_source)+'</a>');if(i.status!=='error'&&!i.forced_french&&i.media_key){const key=encodeURIComponent(i.media_key);if((i.review_status||'pending')==='pending'){a.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="validated">✓ C’est normal</button>');a.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="waiting_replacement">⏳ Attendre</button>')}else{a.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="pending">↩ À traiter</button>')}}return a.join(' ')}
+function mediaActions(i){let a=[];if(i.arr_url)a.push('<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir '+esc(i.arr_source)+'</a>');if(i.status!=='error'&&!i.forced_french&&i.media_key){const key=encodeURIComponent(i.media_key);a.push(`<button class="review-btn" onclick="analyzeLibraryAI(decodeURIComponent('${key}'),false)">🤖 Analyser avec l’IA</button>`);if(i.ai_analyzed)a.push(`<button class="review-btn" onclick="analyzeLibraryAI(decodeURIComponent('${key}'),true)">🔄 Réexaminer avec l’IA</button>`);const rs=i.review_status||'pending';if(rs==='pending'){a.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="validated">✓ C’est normal</button>');a.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="waiting_replacement">⏳ Attendre</button>')}else{a.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="pending">↩ À traiter</button>')}}return a.join(' ')}
 async function setReviewByKey(encodedKey,status){const key=decodeURIComponent(encodedKey);const i=data.find(x=>x.media_key===key);if(!i)return alert('Média introuvable dans les résultats actuels.');try{await api('/library/review',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({media_key:key,review_status:status})});i.review_status=status;i.reviewed_at=status==='pending'?null:Date.now()/1000;render('films');render('series')}catch(e){alert(e.message)}}
-document.addEventListener('click',e=>{const b=e.target.closest('.review-btn');if(b){setReviewByKey(b.dataset.reviewKey,b.dataset.reviewStatus);return}const card=e.target.closest('.series-card');if(card&&!e.target.closest('a,button'))openSeries(card.dataset.seriesKey)});
-function poster(i){return i.poster_url?'<img class="poster" loading="lazy" src="'+esc(i.poster_url)+'" alt="">':'<div class="poster-placeholder">'+(i.type==='Film'?'🎬':'📺')+'</div>'}
-function filmCard(i){return '<article class="media-card"><a target="_blank" href="'+esc(i.arr_url||'#')+'" style="display:block">'+poster(i)+'</a><div class="media-info"><div class="media-title" title="'+esc(i.title)+'">'+esc(i.title)+'</div><div class="media-meta">'+badge(i)+'</div>'+reviewBadge(i)+(i.error?'<div class="small" style="margin-top:6px">'+esc(i.error)+'</div>':'')+'<div class="media-actions">'+mediaActions(i)+'</div></div></article>'}
-function seriesCard(title,items){const first=items[0]||{};const yes=items.filter(i=>i.status!=='error'&&i.forced_french).length,no=items.filter(i=>i.status!=='error'&&!i.forced_french).length,err=items.filter(i=>i.status==='error').length;const needs=items.some(i=>i.status==='error'||(!i.forced_french&&(i.review_status||'pending')==='pending'));const q=($('ss')?.value||'').toLowerCase();if(q&&!title.toLowerCase().includes(q))return '';const sonarr=first.arr_url?'<a class="btn" target="_blank" href="'+esc(first.arr_url)+'">Ouvrir Sonarr</a>':'';const actionInfo=needs?'<span class="series-attention">⚠ '+items.filter(i=>i.status==='error'||(!i.forced_french&&(i.review_status||'pending')==='pending')).length+' à traiter</span>':'';return '<article class="media-card series-card" data-series-key="'+esc(title)+'"><div>'+poster(first)+'</div><div class="media-info"><div class="media-title" title="'+esc(title)+'">'+esc(title)+'</div><div class="media-meta">'+items.length+' épisode(s)</div><div class="series-summary"><span class="mini-pill y">'+yes+' avec FR</span><span class="mini-pill n">'+no+' sans FR</span>'+(err?'<span class="mini-pill w">'+err+' erreur(s)</span>':'')+'</div><div class="media-actions">'+sonarr+'</div></div></article>'}
-function openSeries(title){const items=data.filter(i=>i.type==='Série'&&i.title===title).slice().sort((a,b)=>(a.season_number||0)-(b.season_number||0)||(a.episode_number||0)-(b.episode_number||0));if(!items.length)return;const first=items[0],panel=$('seriesDetail');const episodes=items.map(i=>{const status=i.status==='error'?'<span class="episode-err">⚠ Erreur</span>':i.forced_french?'<span class="episode-ok">✅ Forced FR</span>':'<span class="episode-no">❌ Sans Forced FR</span>';const actions=[];if(i.arr_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir Sonarr</a>');if(i.status!=='error'&&!i.forced_french&&i.media_key){const key=encodeURIComponent(i.media_key),rs=i.review_status||'pending';if(rs==='pending'){actions.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="validated">✓ C’est normal</button>');actions.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="waiting_replacement">⏳ Attendre</button>')}else actions.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="pending">↩ À traiter</button>')}return '<div class="episode-card"><div class="episode-number">'+esc(i.season||'—')+' · '+esc(i.episode||'—')+'</div><div><div class="episode-title">'+esc(i.episode_title||i.episode_name||'Épisode')+'</div><div class="episode-status">'+status+(i.error?' — '+esc(i.error):'')+'</div></div><div class="episode-actions">'+actions.join('')+'</div></div>'}).join('');panel.innerHTML='<button class="btn" onclick="closeSeries()">← Retour aux séries</button><div class="series-detail-head"><div>'+poster(first).replace('class="poster"','class="series-detail-poster"')+'</div><div><div class="series-detail-title">'+esc(title)+'</div><div class="series-detail-meta">'+items.length+' épisode(s) · '+items.filter(i=>i.forced_french).length+' avec Forced FR · '+items.filter(i=>i.status!=='error'&&!i.forced_french).length+' sans Forced FR'+(items.filter(i=>i.status==='error').length?' · '+items.filter(i=>i.status==='error').length+' erreur(s)':'')+'</div><div class="series-detail-actions">'+(first.arr_url?'<a class="btn" target="_blank" href="'+esc(first.arr_url)+'">Ouvrir Sonarr</a>':'')+'</div></div></div><div class="episode-list">'+episodes+'</div>';$('seriesGrid').style.display='none';panel.classList.add('active')}
+function openSeries(title){const items=data.filter(i=>i.type==='Série'&&i.title===title).slice().sort((a,b)=>(a.season_number||0)-(b.season_number||0)||(a.episode_number||0)-(b.episode_number||0));if(!items.length)return;const first=items[0],panel=$('seriesDetail');const episodes=items.map(i=>{const status=i.status==='error'?'<span class="episode-err">⚠ Erreur</span>':i.forced_french?'<span class="episode-ok">✅ Forced FR</span>':'<span class="episode-no">❌ Sans Forced FR</span>';const actions=[];if(!i.forced_french&&i.media_key){const key=encodeURIComponent(i.media_key);actions.push(`<button class="review-btn" onclick="analyzeLibraryAI(decodeURIComponent('${key}'),false)">🤖 IA</button>`);if(i.ai_analyzed)actions.push(`<span class="small">${esc(i.ai_recommendation||'INDETERMINÉ')} ${Math.round((i.ai_confidence||0)*100)}%</span>`)}if(i.arr_url)actions.push('<a class="btn" target="_blank" href="'+esc(i.arr_url)+'">Ouvrir Sonarr</a>');if(i.status!=='error'&&!i.forced_french&&i.media_key){const key=encodeURIComponent(i.media_key),rs=i.review_status||'pending';if(rs==='pending'){actions.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="validated">✓ C’est normal</button>');actions.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="waiting_replacement">⏳ Attendre</button>')}else actions.push('<button class="review-btn" data-review-key="'+key+'" data-review-status="pending">↩ À traiter</button>')}return '<div class="episode-card"><div class="episode-number">'+esc(i.season||'—')+' · '+esc(i.episode||'—')+'</div><div><div class="episode-title">'+esc(i.episode_title||i.episode_name||'Épisode')+'</div><div class="episode-status">'+status+(i.error?' — '+esc(i.error):'')+'</div></div><div class="episode-actions">'+actions.join('')+'</div></div>'}).join('');panel.innerHTML='<button class="btn" onclick="closeSeries()">← Retour aux séries</button><div class="series-detail-head"><div>'+poster(first).replace('class="poster"','class="series-detail-poster"')+'</div><div><div class="series-detail-title">'+esc(title)+'</div><div class="series-detail-meta">'+items.length+' épisode(s) · '+items.filter(i=>i.forced_french).length+' avec Forced FR · '+items.filter(i=>i.status!=='error'&&!i.forced_french).length+' sans Forced FR'+(items.filter(i=>i.status==='error').length?' · '+items.filter(i=>i.status==='error').length+' erreur(s)':'')+'</div><div class="series-detail-actions">'+(first.arr_url?'<a class="btn" target="_blank" href="'+esc(first.arr_url)+'">Ouvrir Sonarr</a>':'')+'</div></div></div><div class="episode-list">'+episodes+'</div>';$('seriesGrid').style.display='none';panel.classList.add('active')}
 function closeSeries(){$('seriesDetail').classList.remove('active');$('seriesGrid').style.display='grid'}
 function render(kind){const r=rows(kind),target=$(kind);if(kind==='films'){target.innerHTML=r.length?r.map(filmCard).join(''):'<div class="empty">Aucun film correspondant.</div>';return}const groups={};r.forEach(i=>(groups[i.title]??=[]).push(i));const html=Object.entries(groups).sort((a,b)=>a[0].localeCompare(b[0],'fr')).map(([title,items])=>seriesCard(title,items)).join('');target.innerHTML=html||'<div class="empty">Aucune série correspondante.</div>'}
 async function loadCached(scope='all'){try{const d=await api('/library/cached?scope='+scope);if(scope==='all')data=d.results||[];else{const other=data.filter(i=>i.type!==(scope==='films'?'Film':'Série'));data=other.concat(d.results||[])}render('films');render('series')}catch(e){console.error(e)}}
@@ -3538,14 +3613,16 @@ function renderHistory(){const q=($('historySearch')?.value||'').toLowerCase(),f
 async function loadDashboard(){const d=await api('/dashboard/stats');const l=d.library,t=d.torrents;const cards=[['Bibliothèque',l.total,'médias'],['Avec Forced FR',l.forced,'validés'],['Sans Forced FR',l.no_forced,'médias'],['🔴 À traiter',l.pending,'médias'],['🟠 En attente',l.waiting,'médias'],['🟢 Absence normale',l.validated,'médias'],['⚠ Erreurs',l.errors,'à traiter'],['Torrents analysés',t.total,'analyses']];$('dashCards').innerHTML=cards.map(c=>'<div class="card"><div class="label">'+c[0]+'</div><div class="value" style="font-size:1.5rem">'+c[1]+'</div><div class="small">'+c[2]+'</div></div>').join('');$('recent').innerHTML=d.recent.length?d.recent.map(i=>{const name=i.torrent_name||'Torrent';const texts={analysis:i.result==='forced_found'?'Analyse terminée : Forced FR détecté':i.result==='no_forced'?'Analyse terminée : aucun Forced FR':'Analyse terminée',auto_pause:'Téléchargement mis en pause automatiquement',pause:'Téléchargement maintenu en pause',resume:'Téléchargement repris'};const label=texts[i.action]||'Action effectuée';return '<div class="activity-row"><div class="activity-date">'+new Date(i.created_at*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</div><div class="activity-main"><div class="activity-action"><span class="activity-dot"></span>'+esc(label)+'</div><div class="activity-details">'+esc(name)+(i.details?' — '+esc(i.details):'')+'</div></div><div>'+ (i.result==='forced_found'?'<span class="badge yes">OK</span>':i.result==='no_forced'?'<span class="badge no">À traiter</span>':'<span class="badge err">Info</span>') +'</div></div>'}).join(''):'<div class="activity-empty">Aucune activité enregistrée pour le moment.</div>'}
 async function loadErrors(){const d=await api('/errors');$('errors').innerHTML=d.results.length?d.results.map(i=>'<tr><td>'+new Date(i.last_seen*1000).toLocaleString('fr-FR',{dateStyle:'short',timeStyle:'short'})+'</td><td><strong>'+esc(i.title||'—')+'</strong><div class="small">'+esc(i.media_type)+' · '+esc(i.path||'')+'</div></td><td>'+esc(i.error)+'</td><td><button class="review-btn" onclick="resolveError('+i.id+')">✓ Marquer traité</button></td></tr>').join(''):'<tr><td colspan="4" class="empty">Aucune erreur à traiter.</td></tr>'}
 async function resolveError(id){try{await api('/errors/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id})});loadErrors();loadDashboard()}catch(e){alert(e.message)}}
-async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value='';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value='';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value='';$('cfgDiscordToken').value='';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value='';$('cfgTZ').value=c.values.TZ||'';$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';loadQbTags();$('profiles').innerHTML=p.results.map(i=>'<div class="profile-card"><div class="profile-top"><div><div class="profile-name">'+esc(i.media_type==='Film'?'🎬 Films':'📺 Séries')+'</div><div class="profile-type">Règles appliquées aux analyses de ce type de média</div></div><span class="status-pill '+(i.enabled?'on':'off')+'">'+(i.enabled?'● Actif':'○ Inactif')+'</span></div><div class="profile-grid"><div class="profile-field"><label>Si Forced FR trouvé</label><select id="found-'+esc(i.name)+'"><option value="validate" '+(i.found_action==='validate'?'selected':'')+'>✓ Valider</option><option value="pause_notify" '+(i.found_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="validate_notify" '+(i.found_action==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option></select></div><div class="profile-field"><label>Si Forced FR absent</label><select id="tm-'+esc(i.name)+'"><option value="pause_notify" '+(i.torrent_missing_action==='pause_notify'?'selected':'')+'>⏸ Mettre en pause + notifier Discord</option><option value="continue_notify" '+(i.torrent_missing_action==='continue_notify'?'selected':'')+'>▶ Continuer + notifier Discord</option><option value="pause_decision" '+(i.torrent_missing_action==='pause_decision'?'selected':'')+'>❓ Mettre en pause et demander une décision</option></select></div><div class="profile-field"><label>Après scan bibliothèque</label><select id="miss-'+esc(i.name)+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div><div class="profile-field"><label>Si erreur d’analyse</label><select id="err-'+esc(i.name)+'" onchange="toggleRetryFields('+JSON.stringify(i.name)+')"><option value="notify_continue" '+(i.error_action==='notify_continue'?'selected':'')+'>▶ Continuer + notifier</option><option value="pause_decision" '+(i.error_action==='pause_decision'?'selected':'')+'>⏸ Pause + demander une décision</option><option value="retry_pause" '+(i.error_action==='retry_pause'?'selected':'')+'>🔄 Réessayer puis mettre en pause</option><option value="retry_continue" '+(i.error_action==='retry_continue'?'selected':'')+'>🔄 Réessayer puis continuer</option></select><div class="retry-fields" id="retry-'+esc(i.name)+'" style="display:'+(i.error_action==='retry_pause'||i.error_action==='retry_continue'?'grid':'none')+'"><label>Nombre de tentatives<input type="number" min="1" max="20" id="retries-'+esc(i.name)+'" value="'+(i.error_retries||5)+'"></label><label>Délai entre tentatives (s)<input type="number" min="1" max="3600" id="delay-'+esc(i.name)+'" value="'+(i.error_retry_delay||30)+'"></label></div></div></div><div class="profile-footer"><label class="setting-item" style="padding:0;border:0;justify-content:flex-start"><input type="checkbox" id="ena-'+esc(i.name)+'" '+(i.enabled?'checked':'')+' style="min-width:0;flex:none"><span>Profil actif</span></label><button type="button" class="primary profile-save" data-profile-name="'+esc(i.name)+'" data-profile-type="'+esc(i.media_type)+'" data-forced-required="'+(i.forced_required?'1':'0')+'">💾 Enregistrer</button></div></div>').join('');document.querySelectorAll('.profile-save').forEach(b=>b.addEventListener('click',()=>saveProfile(b.dataset.profileName,b.dataset.profileType,b.dataset.forcedRequired==='1')))}
+async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);
+$('setAIEnabled').checked=s.ai_enabled;$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgBraveResults').value=s.brave_results_count;$('confFilmsNecessary').value=s.ai_confidence.films.necessary;$('confFilmsNotNecessary').value=s.ai_confidence.films.not_necessary;$('confSeriesNecessary').value=s.ai_confidence.series.necessary;$('confSeriesNotNecessary').value=s.ai_confidence.series.not_necessary;
+$('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value=c.values.QB_PASSWORD||'';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value=c.values.RADARR_API_KEY||'';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value=c.values.SONARR_API_KEY||'';$('cfgDiscordToken').value=c.values.DISCORD_BOT_TOKEN||'';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value=c.values.DISCORD_WEBHOOK_URL||'';$('cfgTZ').value=c.values.TZ||'';$('cfgGroqKey').value=c.values.GROQ_API_KEY||'';$('cfgGroqModel').value=c.values.GROQ_MODEL||'';$('cfgBraveKey').value=c.values.BRAVE_SEARCH_API_KEY||'';$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';loadQbTags();
+const film=p.results.find(i=>i.media_type==='Film')||p.results[0];const series=p.results.find(i=>i.media_type==='Série')||p.results[1]||p.results[0];if(film)$('profileFilm').innerHTML=profileEditor(film);if(series)$('profileSeries').innerHTML=profileEditor(series);$('profileErrors').innerHTML='<div class="small">Les options d’erreur sont disponibles dans chaque profil ci-dessus.</div>';
+}
+function profileEditor(i){const n=esc(i.name);return '<div class="profile-grid"><div class="profile-field"><label>Si FR Forced trouvée</label><select id="found-'+n+'"><option value="validate" '+(i.found_action==='validate'?'selected':'')+'>✓ Valider</option><option value="pause_notify" '+(i.found_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="validate_notify" '+(i.found_action==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option></select></div><div class="profile-field"><label>Si FR Forced absente avant IA</label><select id="tm-'+n+'"><option value="pause_notify" '+(i.torrent_missing_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue_notify" '+(i.torrent_missing_action==='continue_notify'?'selected':'')+'>▶ Continuer le téléchargement + notifier Discord</option><option value="pause_decision" '+(i.torrent_missing_action==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option></select></div><div class="profile-field"><label>Après scan bibliothèque</label><select id="miss-'+n+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div></div><div class="profile-card" style="margin-top:12px"><div class="profile-name">🤖 Décisions IA</div><div class="profile-grid"><div class="profile-field"><label>🟢 NÉCESSAIRE</label><select id="aiN-'+n+'">'+aiActionOptions(i.ai_necessary_action)+'</select></div><div class="profile-field"><label>🔵 NON NÉCESSAIRE</label><select id="aiNN-'+n+'">'+aiActionOptions(i.ai_not_necessary_action)+'</select></div><div class="profile-field"><label>🟠 INDETERMINÉ</label><select id="aiI-'+n+'">'+aiActionOptions(i.ai_indeterminate_action)+'</select></div></div></div><div class="profile-card" style="margin-top:12px"><div class="profile-name">⚠️ Erreur d’analyse</div><div class="profile-field"><label>Action</label><select id="err-'+n+'" onchange="toggleRetryFields('+JSON.stringify(i.name)+')"><option value="notify_continue" '+(i.error_action==='notify_continue'?'selected':'')+'>▶ Continuer le téléchargement + notifier</option><option value="pause_decision" '+(i.error_action==='pause_decision'?'selected':'')+'>⏸ Laisser en pause + demander une décision</option><option value="retry_pause" '+(i.error_action==='retry_pause'?'selected':'')+'>🔄 Réessayer puis laisser en pause</option><option value="retry_continue" '+(i.error_action==='retry_continue'?'selected':'')+'>🔄 Réessayer puis continuer</option></select><div class="retry-fields" id="retry-'+n+'" style="display:'+(i.error_action==='retry_pause'||i.error_action==='retry_continue'?'grid':'none')+'"><label>Nombre de tentatives<input type="number" min="1" max="20" id="retries-'+n+'" value="'+(i.error_retries||5)+'"></label><label>Délai entre tentatives (s)<input type="number" min="1" max="3600" id="delay-'+n+'" value="'+(i.error_retry_delay||30)+'"></label></div></div></div><div class="profile-footer"><label><input type="checkbox" id="ena-'+n+'" '+(i.enabled?'checked':'')+'> Profil actif</label><button type="button" class="primary" onclick="saveProfile('+JSON.stringify(i.name)+','+JSON.stringify(i.media_type)+','+(i.forced_required?'true':'false')+')">💾 Enregistrer le profil</button></div>'}
+function aiActionOptions(v){return '<option value="pause_notify" '+(v==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue_notify" '+(v==='continue_notify'?'selected':'')+'>▶ Continuer le téléchargement + notifier Discord</option><option value="pause_decision" '+(v==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option><option value="validate_notify" '+(v==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option>'}
 function toggleRetryFields(name){const v=$('err-'+name).value;const box=$('retry-'+name);if(box)box.style.display=(v==='retry_pause'||v==='retry_continue')?'grid':'none'}
-async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,found_action:$('found-'+name).value,torrent_missing_action:$('tm-'+name).value,error_action:$('err-'+name).value,error_retries:parseInt($('retries-'+name)?.value||5,10),error_retry_delay:parseFloat($('delay-'+name)?.value||30),enabled:$('ena-'+name).checked})});alert('Profil enregistré.')}catch(e){alert(e.message)}}
-async function testConnection(kind){const el=$('test-'+kind);el.className='test-result warn';el.textContent='Test en cours…';try{const d=await api('/test/'+kind,{method:'POST'});el.className='test-result '+(d.ok?'ok':'bad');el.textContent=(d.ok?'✓ ':'✕ ')+d.message}catch(e){el.className='test-result bad';el.textContent='✕ '+e.message}}
-async function loadQbTags(){try{const d=await api('/qbittorrent/tags');const box=$('qbTagsAvailable');if(!box)return;if(!d.results.length){box.innerHTML='<span class="small">Aucune étiquette trouvée dans qBittorrent.</span>';return}box.innerHTML=d.results.map(t=>'<button type="button" class="tag-chip" data-qb-tag="'+esc(t)+'">'+esc(t)+'</button>').join('');box.querySelectorAll('.tag-chip').forEach(b=>b.addEventListener('click',()=>addIgnoredTag(b.dataset.qbTag,b)))}catch(e){const box=$('qbTagsAvailable');if(box)box.innerHTML='<span class="small warn">Impossible de récupérer les étiquettes qBittorrent.</span>'}}
-function addIgnoredTag(tag,button){const input=$('cfgQBIgnoredTags');const current=input.value.split(',').map(x=>x.trim()).filter(Boolean);const exists=current.some(x=>x.toLowerCase()===tag.toLowerCase());if(!exists){current.push(tag);input.value=current.join(', ')}if(button){button.classList.toggle('selected',true);button.title='Étiquette déjà sélectionnée';}}
-
-async function saveConnectionSettings(){try{const payload={QB_HOST:$('cfgQBHost').value,QB_USERNAME:$('cfgQBUsername').value,QB_PASSWORD:$('cfgQBPassword').value,RADARR_URL:$('cfgRadarrUrl').value,RADARR_API_KEY:$('cfgRadarrKey').value,SONARR_URL:$('cfgSonarrUrl').value,SONARR_API_KEY:$('cfgSonarrKey').value,DISCORD_BOT_TOKEN:$('cfgDiscordToken').value,DISCORD_CHANNEL_ID:$('cfgDiscordChannel').value,DISCORD_WEBHOOK_URL:$('cfgDiscordWebhook').value,TZ:$('cfgTZ').value};await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Connexions enregistrées.');refresh()}catch(e){alert(e.message)}}
+async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,found_action:$('found-'+name).value,torrent_missing_action:$('tm-'+name).value,error_action:$('err-'+name).value,error_retries:parseInt($('retries-'+name)?.value||5,10),error_retry_delay:parseFloat($('delay-'+name)?.value||30),ai_necessary_action:$('aiN-'+name).value,ai_not_necessary_action:$('aiNN-'+name).value,ai_indeterminate_action:$('aiI-'+name).value,enabled:$('ena-'+name).checked})});alert('Profil enregistré.');loadSettings()}catch(e){alert(e.message)}}
+async function saveAISettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ai_enabled:$('setAIEnabled').checked,notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked,brave_results_count:parseInt($('cfgBraveResults').value||5,10),ai_necessary_min_confidence_films:parseFloat($('confFilmsNecessary').value||70),ai_not_necessary_min_confidence_films:parseFloat($('confFilmsNotNecessary').value||70),ai_necessary_min_confidence_series:parseFloat($('confSeriesNecessary').value||70),ai_not_necessary_min_confidence_series:parseFloat($('confSeriesNotNecessary').value||70),qb_ignored_tags:$('cfgQBIgnoredTags').value})});await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({GROQ_API_KEY:$('cfgGroqKey').value,GROQ_MODEL:$('cfgGroqModel').value,BRAVE_SEARCH_API_KEY:$('cfgBraveKey').value})});alert('Paramètres IA enregistrés.');loadSettings()}catch(e){alert(e.message)}}
 async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked,qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
 $('historyFilter').onchange=renderHistory;$('historySearch').oninput=renderHistory;
 async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}(async()=>{try{await loadCached('all')}catch(e){console.error(e)}loadDashboard();refresh()})();
@@ -3657,6 +3734,27 @@ def test_discord() -> dict[str, Any]:
         return {"ok": False, "message": f"Discord : {exc}"}
 
 
+@app.post("/test/groq")
+def test_groq() -> dict[str, Any]:
+    try:
+        key = GROQ_API_KEY or _setting("config_GROQ_API_KEY", "")
+        if not key:
+            return {"ok": False, "message": "Clé Groq non configurée."}
+        result = _groq_generate("Film", "ForcedFR test", [{"title":"Test","url":"https://example.com","description":"Test technique uniquement."}], {})
+        return {"ok": True, "message": f"Groq connecté — modèle {result.get('model') or GROQ_MODEL}."}
+    except Exception as exc:
+        return {"ok": False, "message": f"Groq : {exc}"}
+
+
+@app.post("/test/brave")
+def test_brave() -> dict[str, Any]:
+    try:
+        results = _brave_search("ForcedFR test", "Film")
+        return {"ok": True, "message": f"Brave Search connecté — {len(results)} résultat(s)."}
+    except Exception as exc:
+        return {"ok": False, "message": f"Brave : {exc}"}
+
+
 @app.get("/configuration")
 def configuration() -> dict[str, Any]:
     secret_keys = {"DISCORD_BOT_TOKEN", "DISCORD_WEBHOOK_URL", "QB_PASSWORD", "RADARR_API_KEY", "SONARR_API_KEY", "GROQ_API_KEY", "BRAVE_SEARCH_API_KEY"}
@@ -3665,10 +3763,9 @@ def configuration() -> dict[str, Any]:
     for key, fallback in CONFIG_FALLBACKS.items():
         value = _setting("config_" + key, fallback)
         configured[key] = bool(value)
-        if key in secret_keys:
-            values[key] = "" if not value else "••••••••"
-        else:
-            values[key] = value
+        # Les clés/API sont volontairement affichées en clair dans les paramètres,
+        # conformément au choix utilisateur.
+        values[key] = value
     return {"values": values, "configured": configured}
 
 
@@ -3710,8 +3807,17 @@ def settings() -> dict[str, Any]:
         "qb_ignored_tags": _setting("qb_ignored_tags", ""),
         "ai_enabled": _setting_bool("ai_enabled", True),
         "brave_results_count": int(_setting("brave_results_count", "5") or 5),
+        "ai_confidence": {
+            "films": {
+                "necessary": float(_setting("ai_necessary_min_confidence_films", "70") or 70),
+                "not_necessary": float(_setting("ai_not_necessary_min_confidence_films", "70") or 70),
+            },
+            "series": {
+                "necessary": float(_setting("ai_necessary_min_confidence_series", "70") or 70),
+                "not_necessary": float(_setting("ai_not_necessary_min_confidence_series", "70") or 70),
+            },
+        },
     }
-
 
 
 @app.post("/settings")
@@ -3721,14 +3827,15 @@ def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
     if "notify_errors" in payload:
         set_setting("notify_errors", "1" if bool(payload["notify_errors"]) else "0")
     if "qb_ignored_tags" in payload:
-        tags = str(payload.get("qb_ignored_tags") or "")
-        set_setting("qb_ignored_tags", tags)
+        set_setting("qb_ignored_tags", str(payload.get("qb_ignored_tags") or ""))
     if "ai_enabled" in payload:
         set_setting("ai_enabled", "1" if bool(payload["ai_enabled"]) else "0")
     if "brave_results_count" in payload:
         set_setting("brave_results_count", str(max(1, min(10, int(payload.get("brave_results_count") or 5)))))
+    for key in ("ai_necessary_min_confidence_films", "ai_not_necessary_min_confidence_films", "ai_necessary_min_confidence_series", "ai_not_necessary_min_confidence_series"):
+        if key in payload:
+            set_setting(key, str(max(0.0, min(100.0, float(payload.get(key) or 70)))))
     return settings()
-
 
 
 @app.get("/profiles")
@@ -3766,6 +3873,92 @@ def history() -> dict[str, Any]:
         "persistent": True,
         "storage": "sqlite",
     }
+
+
+def _find_library_item_by_media_key(media_key: str) -> tuple[dict[str, Any], Path] | None:
+    for scope in ("films", "series"):
+        for item in _scan_items(scope):
+            path = item.get("path")
+            if not path:
+                continue
+            if _media_review_key(item, path) == media_key:
+                return item, Path(path)
+    return None
+
+
+def _library_ai_result(item: dict[str, Any], file_path: Path, force: bool = False) -> dict[str, Any]:
+    cached = _cached_analysis(item, file_path)
+    if not cached or cached.get("forced_french"):
+        raise RuntimeError("Ce média ne peut pas être analysé par l'IA : il est absent du cache ForcedFR ou possède déjà une piste FR Forced.")
+    media_type = str(item.get("type") or "Film")
+    title = str(item.get("title") or file_path.stem)
+    if not force:
+        existing = _ai_cache_get(media_type, title)
+        if existing:
+            decision, confidence, _ = _normalize_ai_decision(media_type, existing)
+            existing["recommendation"] = decision
+            existing["confidence"] = confidence
+            return existing
+    probe_summary = {
+        "forced_french": bool(cached.get("forced_french")),
+        "forced_tracks": cached.get("forced_tracks", []),
+        "subtitles": cached.get("subtitles", []),
+    }
+    dummy = {"hash": f"library:{_ai_cache_key(media_type,title)}", "name": title, "progress": 1.0}
+    result = research_forced_fr_with_ai(dummy, media_type, title, probe_summary, ignore_cache=force)
+    decision, confidence, _ = _normalize_ai_decision(media_type, result)
+    result["recommendation"] = decision
+    result["confidence"] = confidence
+    return result
+
+
+@app.post("/library/ai")
+def library_ai(payload: dict[str, Any]) -> dict[str, Any]:
+    media_key = str(payload.get("media_key") or "").strip()
+    force = bool(payload.get("force", False))
+    if not media_key:
+        raise HTTPException(status_code=400, detail="media_key manquant.")
+    found = _find_library_item_by_media_key(media_key)
+    if not found:
+        raise HTTPException(status_code=404, detail="Média introuvable dans Radarr/Sonarr.")
+    item, path = found
+    try:
+        result = _library_ai_result(item, path, force=force)
+        return {"ok": True, "media_key": media_key, "title": item.get("title"), "type": item.get("type"), "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/library/ai/bulk")
+def library_ai_bulk(payload: dict[str, Any]) -> dict[str, Any]:
+    scope = str(payload.get("scope") or "films")
+    force = bool(payload.get("force", False))
+    if scope not in {"films", "series", "all"}:
+        raise HTTPException(status_code=400, detail="Scope invalide.")
+    items = _scan_items(scope)
+    eligible=[]
+    for item in items:
+        path=item.get("path")
+        if not path:
+            continue
+        try:
+            cached=_cached_analysis(item,path)
+            if cached and not cached.get("forced_french"):
+                if force or not _ai_cache_get(str(item.get("type") or "Film"), str(item.get("title") or Path(path).stem)):
+                    eligible.append((item,Path(path)))
+        except Exception:
+            continue
+    if not eligible:
+        return {"ok":True,"started":False,"count":0,"message":"Aucun média nouveau à analyser avec l'IA."}
+    def worker():
+        for item,path in eligible:
+            try:
+                _library_ai_result(item,path,force=force)
+                log.info("[AI-LIBRARY] Analyse IA terminée : %s",item.get("title"))
+            except Exception as exc:
+                log.error("[AI-LIBRARY] Erreur sur %s : %s",item.get("title"),exc)
+    threading.Thread(target=worker,daemon=True,name="forcedfr-ai-library").start()
+    return {"ok":True,"started":True,"count":len(eligible),"message":f"{len(eligible)} média(s) placé(s) dans la file d'analyse IA."}
 
 
 @app.post("/library/review")
