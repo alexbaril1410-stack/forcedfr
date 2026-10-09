@@ -103,7 +103,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.6.9",
+    version="2.6.10",
 )
 
 
@@ -127,6 +127,7 @@ discord_bot: Any = None
 
 # Évite qu'une même notification Discord soit traitée plusieurs fois.
 resolved_discord_actions: set[str] = set()
+discord_lifecycle_task: asyncio.Task | None = None
 
 
 # ============================================================
@@ -143,12 +144,10 @@ def qb_login() -> None:
         timeout=10,
     )
 
+    if response.status_code == 403:
+        raise RuntimeError("IP bannie par qBittorrent après trop de tentatives d'authentification. Ne réessaie pas pendant le bannissement.")
     if response.status_code not in (200, 204):
-        raise RuntimeError(
-            f"Authentification qBittorrent échouée : "
-            f"HTTP {response.status_code} "
-            f"{response.text}"
-        )
+        raise RuntimeError(f"Authentification qBittorrent échouée : HTTP {response.status_code} {response.text}")
 
     log.info(
         "Connexion qBittorrent réussie : %s",
@@ -160,55 +159,14 @@ def qb_login() -> None:
 # REQUÊTES qBITTORRENT
 # ============================================================
 
-def qb_request(
-    method: str,
-    endpoint: str,
-    *,
-    params: dict[str, Any] | None = None,
-    data: dict[str, Any] | None = None,
-) -> Any:
-
-    response = qb_session.request(
-        method,
-        f"{QB_HOST}{endpoint}",
-        params=params,
-        data=data,
-        timeout=15,
-    )
-
-    # Session expirée
-    if response.status_code == 403:
-
-        log.info(
-            "Session qBittorrent expirée, "
-            "nouvelle authentification."
-        )
-
-        qb_login()
-
-        response = qb_session.request(
-            method,
-            f"{QB_HOST}{endpoint}",
-            params=params,
-            data=data,
-            timeout=15,
-        )
-
+def qb_request(method: str, endpoint: str, *, params: dict[str, Any] | None = None, data: dict[str, Any] | None = None) -> Any:
+    response=qb_session.request(method,f"{QB_HOST}{endpoint}",params=params,data=data,timeout=15)
+    if response.status_code==403:
+        raise RuntimeError("qBittorrent a répondu HTTP 403 : accès refusé ou IP bannie. Aucun nouvel essai d'authentification automatique n'est effectué.")
     response.raise_for_status()
-
-    if not response.text:
-        return None
-
-    content_type = response.headers.get(
-        "content-type",
-        "",
-    )
-
-    if "application/json" in content_type:
-        return response.json()
-
+    if not response.text: return None
+    if "application/json" in response.headers.get("content-type",""): return response.json()
     return response.text
-
 
 # ============================================================
 # INFORMATIONS TORRENTS
@@ -603,144 +561,57 @@ def build_qbittorrent_url(
     return f"{QB_HOST}/#torrent={torrent_hash}"
 
 
-async def _send_discord_bot_message(
-    *,
-    embeds: list[dict[str, Any]],
-    torrent_hash: str,
-    release: dict[str, Any],
-) -> None:
-    if discord_bot is None or not discord_bot.is_ready():
-        raise RuntimeError("Bot Discord non prêt.")
-
-    if not DISCORD_CHANNEL_ID:
-        raise RuntimeError("DISCORD_CHANNEL_ID non configuré.")
-
-    channel = discord_bot.get_channel(int(DISCORD_CHANNEL_ID))
-    if channel is None:
-        channel = await discord_bot.fetch_channel(int(DISCORD_CHANNEL_ID))
-
-    enriched_embeds = []
-    poster_url = str(release.get("poster_url") or "").strip() if release else ""
+async def _send_discord_bot_message(*, embeds: list[dict[str, Any]], torrent_hash: str, release: dict[str, Any], decision_required: bool = False) -> Any:
+    if discord_bot is None or not discord_bot.is_ready(): raise RuntimeError("Bot Discord non prêt.")
+    if not DISCORD_CHANNEL_ID: raise RuntimeError("DISCORD_CHANNEL_ID non configuré.")
+    channel=discord_bot.get_channel(int(DISCORD_CHANNEL_ID))
+    if channel is None: channel=await discord_bot.fetch_channel(int(DISCORD_CHANNEL_ID))
+    enriched=[]; poster_url=str(release.get("poster_url") or "").strip() if release else ""
     for embed in embeds:
-        item = dict(embed)
-        if poster_url and not item.get("image"):
-            item["image"] = {"url": poster_url}
-        enriched_embeds.append(item)
-    embed_objects = [discord.Embed.from_dict(embed) for embed in enriched_embeds]
-    view = ForcedFRView(torrent_hash, release)
-    await channel.send(embeds=embed_objects, view=view)
+        item=dict(embed)
+        if poster_url and not item.get("image"): item["image"]={"url":poster_url}
+        enriched.append(item)
+    return await channel.send(embeds=[discord.Embed.from_dict(e) for e in enriched], view=ForcedFRView(torrent_hash,release,decision_required=decision_required))
 
 
-def send_discord_message(
-    *,
-    embeds: list[dict[str, Any]],
-    torrent_hash: str | None = None,
-    release: dict[str, Any] | None = None,
-) -> None:
-    """Envoie la notification via le bot pour permettre les boutons interactifs."""
+def _discord_record_message(message: Any, torrent_hash: str, decision_required: bool) -> None:
+    if message is None or not DISCORD_CHANNEL_ID: return
+    try:
+        with _db_connect() as conn:
+            conn.execute("INSERT INTO discord_messages(message_id,channel_id,torrent_hash,decision_required,sent_at,reminder_sent,resolved,deleted_at) VALUES (?,?,?,?,?,?,?,NULL)",(str(message.id),str(DISCORD_CHANNEL_ID),str(torrent_hash),int(bool(decision_required)),time.time(),0,0))
+    except Exception: log.exception("Impossible d'enregistrer le message Discord %s.",getattr(message,"id","?"))
+
+
+def send_discord_message(*, embeds: list[dict[str, Any]], torrent_hash: str | None = None, release: dict[str, Any] | None = None, decision_required: bool = False) -> None:
     if discord_bot is not None and MAIN_EVENT_LOOP is not None and torrent_hash and release:
         try:
-            future = asyncio.run_coroutine_threadsafe(
-                _send_discord_bot_message(
-                    embeds=embeds,
-                    torrent_hash=torrent_hash,
-                    release=release,
-                ),
-                MAIN_EVENT_LOOP,
-            )
-            future.result(timeout=15)
-            log.info("Notification Discord envoyée via le bot.")
-            return
-        except Exception:
-            log.exception("Impossible d'envoyer la notification via le bot Discord.")
-            return
-
-    log.warning("Bot Discord indisponible : notification interactive non envoyée.")
+            future=asyncio.run_coroutine_threadsafe(_send_discord_bot_message(embeds=embeds,torrent_hash=torrent_hash,release=release,decision_required=decision_required),MAIN_EVENT_LOOP)
+            message=future.result(timeout=15); _discord_record_message(message,torrent_hash,decision_required); log.info("Notification Discord envoyée%s."," avec prise de décision" if decision_required else ""); return
+        except Exception: log.exception("Impossible d'envoyer la notification via le bot Discord.")
+    log.warning("Bot Discord indisponible : notification non envoyée.")
 
 
 class ForcedFRView(discord.ui.View if discord else object):
-    def __init__(self, torrent_hash: str, release: dict[str, Any]) -> None:
-        if discord is None:
-            return
-        super().__init__(timeout=None)
-
-        tracker_url = release.get("tracker_url")
-        arr_item_url = release.get("arr_item_url")
-        source = release.get("source")
-
-        if tracker_url:
-            self.add_item(discord.ui.Button(
-                label="🌐 Voir le torrent",
-                style=discord.ButtonStyle.link,
-                url=tracker_url,
-            ))
-
-        self.add_item(discord.ui.Button(
-            label="🖥️ Ouvrir qBittorrent",
-            style=discord.ButtonStyle.link,
-            url=build_qbittorrent_url(torrent_hash),
-        ))
-
+    def __init__(self,torrent_hash: str,release: dict[str,Any],decision_required: bool=False)->None:
+        if discord is None: return
+        super().__init__(timeout=None); tracker_url=release.get("tracker_url"); arr_item_url=release.get("arr_item_url"); source=release.get("source")
+        if tracker_url: self.add_item(discord.ui.Button(label="🌐 Voir le torrent",style=discord.ButtonStyle.link,url=tracker_url))
+        self.add_item(discord.ui.Button(label="🖥️ Ouvrir qBittorrent",style=discord.ButtonStyle.link,url=build_qbittorrent_url(torrent_hash)))
         if arr_item_url:
-            label = "🎬 Ouvrir Radarr" if source == "Radarr" else "📺 Ouvrir Sonarr"
-            self.add_item(discord.ui.Button(
-                label=label,
-                style=discord.ButtonStyle.link,
-                url=arr_item_url,
-            ))
-
-        self.add_item(discord.ui.Button(
-            label="▶️ Continuer le téléchargement",
-            style=discord.ButtonStyle.success,
-            custom_id=f"forcedfr:resume:{torrent_hash}",
-        ))
-
-        self.add_item(discord.ui.Button(
-            label="⏸️ Laisser en pause",
-            style=discord.ButtonStyle.secondary,
-            custom_id=f"forcedfr:pause:{torrent_hash}",
-        ))
+            label="🎬 Ouvrir Radarr" if source=="Radarr" else "📺 Ouvrir Sonarr"; self.add_item(discord.ui.Button(label=label,style=discord.ButtonStyle.link,url=arr_item_url))
+        if decision_required:
+            self.add_item(discord.ui.Button(label="▶️ Continuer le téléchargement",style=discord.ButtonStyle.success,custom_id=f"forcedfr:resume:{torrent_hash}"))
+            self.add_item(discord.ui.Button(label="⏸️ Laisser en pause",style=discord.ButtonStyle.secondary,custom_id=f"forcedfr:pause:{torrent_hash}"))
 
 
 def build_disabled_decision_view(message: Any) -> Any:
-    """
-    Reconstruit les boutons après une décision.
-
-    Les liens restent actifs. Seuls les boutons interactifs
-    Continuer / Laisser en pause sont désactivés.
-    """
-    if discord is None:
-        return None
-
-    view = discord.ui.View(timeout=None)
-
-    for row in getattr(message, "components", []):
-        for component in getattr(row, "children", []):
-            custom_id = getattr(component, "custom_id", None)
-            url = getattr(component, "url", None)
-
-            disabled = bool(
-                custom_id
-                and str(custom_id).startswith("forcedfr:")
-            )
-
-            view.add_item(
-                discord.ui.Button(
-                    label=getattr(component, "label", None),
-                    style=getattr(
-                        component,
-                        "style",
-                        discord.ButtonStyle.secondary,
-                    ),
-                    custom_id=custom_id,
-                    url=url,
-                    emoji=getattr(component, "emoji", None),
-                    disabled=disabled,
-                )
-            )
-
+    if discord is None: return None
+    view=discord.ui.View(timeout=None)
+    for row in getattr(message,"components",[]):
+        for component in getattr(row,"children",[]):
+            custom_id=getattr(component,"custom_id",None); url=getattr(component,"url",None)
+            view.add_item(discord.ui.Button(label=getattr(component,"label",None),style=getattr(component,"style",discord.ButtonStyle.secondary),custom_id=custom_id,url=url,emoji=getattr(component,"emoji",None),disabled=bool(custom_id and str(custom_id).startswith("forcedfr:"))))
     return view
-
 
 class ForcedFRTestView(discord.ui.View if discord else object):
     def __init__(self) -> None:
@@ -857,19 +728,14 @@ def build_discord_bot() -> Any:
                 details=response_message,
             )
 
-            # Désactive les boutons de décision tout en conservant
-            # les liens vers torrent / qBittorrent / Radarr-Sonarr.
+            try:
+                with _db_connect() as conn:
+                    conn.execute("UPDATE discord_messages SET resolved=1 WHERE message_id=?",(str(getattr(interaction.message,"id","")),))
+            except Exception: pass
             if interaction.message is not None:
-                await interaction.message.edit(
-                    view=build_disabled_decision_view(
-                        interaction.message
-                    )
-                )
-
-            await interaction.followup.send(
-                response_message,
-                ephemeral=True,
-            )
+                try: await interaction.message.delete()
+                except Exception: log.exception("Impossible de supprimer le message Discord après décision.")
+            await interaction.followup.send(response_message,ephemeral=True)
 
             log.info(
                 "[%s] Décision Discord enregistrée : %s.",
@@ -920,50 +786,18 @@ def build_discord_bot() -> Any:
     return bot
 
 
-def build_release_fields(
-    torrent: dict[str, Any],
-    release: dict[str, Any],
-) -> list[dict[str, Any]]:
+def _discord_media_name(torrent: dict[str, Any], release: dict[str, Any] | None) -> str:
+    rel=str((release or {}).get("title") or "").strip(); raw=str(torrent.get("name") or "").strip(); title=rel or raw or "Média inconnu"
+    if (release or {}).get("source")=="Sonarr":
+        m=re.search(r"(S\d{1,2}E\d{1,3}(?:[- &]?E\d{1,3})?)",raw,re.I)
+        if m and m.group(1).upper() not in title.upper(): title=f"{title} — {m.group(1).upper()}"
+    return title
 
-    fields = [
-        {
-            "name": "Torrent",
-            "value": (
-                f"`{torrent.get('name', 'Nom inconnu')}`"
-            )[:1024],
-            "inline": False,
-        },
-        {
-            "name": "Progression",
-            "value": (
-                f"{float(torrent.get('progress', 0)) * 100:.2f}%"
-            ),
-            "inline": True,
-        },
-    ]
 
-    if release.get("source"):
-
-        fields.append(
-            {
-                "name": "Source",
-                "value": release["source"],
-                "inline": True,
-            }
-        )
-
-    if release.get("indexer"):
-
-        fields.append(
-            {
-                "name": "Indexeur",
-                "value": str(
-                    release["indexer"]
-                )[:1024],
-                "inline": True,
-            }
-        )
-
+def build_release_fields(torrent: dict[str, Any], release: dict[str, Any]) -> list[dict[str, Any]]:
+    fields=[{"name":"Progression","value":f"{float(torrent.get('progress',0))*100:.2f}%","inline":True}]
+    if release.get("source"): fields.append({"name":"Source","value":str(release["source"]),"inline":True})
+    if release.get("indexer"): fields.append({"name":"Indexeur","value":str(release["indexer"])[:1024],"inline":True})
     return fields
 
 
@@ -1039,57 +873,49 @@ def notify_no_french_forced(
     )
 
 
-def notify_profile_decision(torrent: dict[str, Any], title: str, description: str, action_text: str, release: dict[str, Any] | None = None) -> None:
-    torrent_hash = str(torrent.get("hash", ""))
-    if release is None:
-        try:
-            release = wait_for_release_context(torrent_hash)
-        except Exception:
-            release = None
-    if release is None:
-        release = {"source": None, "title": torrent.get("name"), "indexer": None, "tracker_url": None, "arr_item_url": None, "item_id": None}
-    else:
-        update_torrent_release_context(torrent_hash, release)
-    fields = build_release_fields(torrent, release)
-    fields.append({"name": "Action ForcedFR", "value": action_text, "inline": False})
-    embed = {"title": title, "description": description, "color": 5763719, "fields": fields, "footer": {"text": "ForcedFR • Notification"}}
-    if release.get("poster_url"):
-        embed["image"] = {"url": str(release["poster_url"])}
-    send_discord_message(embeds=[embed], torrent_hash=torrent_hash, release=release)
-
-
-def notify_analysis_error(torrent: dict[str, Any], error: str, *, action_text: str, attempt: int | None = None, release: dict[str, Any] | None = None) -> None:
+def notify_profile_decision(torrent: dict[str, Any], title: str, description: str, action_text: str, release: dict[str, Any] | None = None, *, decision_required: bool = False) -> None:
     torrent_hash=str(torrent.get("hash",""))
     if release is None:
         try: release=wait_for_release_context(torrent_hash)
         except Exception: release=None
-    if release is None:
-        release={"source":None,"title":torrent.get("name"),"indexer":None,"tracker_url":None,"arr_item_url":None,"item_id":None}
+    if release is None: release={"source":None,"title":torrent.get("name"),"indexer":None,"tracker_url":None,"arr_item_url":None,"item_id":None}
     else: update_torrent_release_context(torrent_hash,release)
-    fields=build_release_fields(torrent,release)
-    text=str(error).strip() or "Erreur inconnue"
+    fields=build_release_fields(torrent,release); fields.append({"name":"Action ForcedFR","value":action_text,"inline":False})
+    media_name=_discord_media_name(torrent,release)
+    embed={"title":f"{title} — {media_name}","description":description,"color":5763719,"fields":fields,"footer":{"text":"ForcedFR • Décision nécessaire" if decision_required else "ForcedFR • Notification"}}
+    if release.get("poster_url"): embed["image"]={"url":str(release["poster_url"])}
+    send_discord_message(embeds=[embed],torrent_hash=torrent_hash,release=release,decision_required=decision_required)
+
+
+def notify_analysis_error(torrent: dict[str, Any], error: str, *, action_text: str, attempt: int | None = None, release: dict[str, Any] | None = None, decision_required: bool = False) -> None:
+    torrent_hash=str(torrent.get("hash",""))
+    if release is None:
+        try: release=wait_for_release_context(torrent_hash)
+        except Exception: release=None
+    if release is None: release={"source":None,"title":torrent.get("name"),"indexer":None,"tracker_url":None,"arr_item_url":None,"item_id":None}
+    else: update_torrent_release_context(torrent_hash,release)
+    fields=build_release_fields(torrent,release); text=str(error).strip() or "Erreur inconnue"
     fields += [{"name":"Erreur d'analyse","value":f"```{text[:1000]}```","inline":False},{"name":"Action ForcedFR","value":action_text,"inline":False}]
     if attempt is not None: fields.append({"name":"Tentative","value":str(attempt),"inline":True})
-    send_discord_message(embeds=[{"title":"⚠️ Erreur pendant l'analyse ForcedFR","description":"ForcedFR n'a pas pu déterminer le résultat de manière fiable.","color":16776960,"fields":fields,"footer":{"text":"ForcedFR • Erreur d'analyse"}}],torrent_hash=torrent_hash,release=release)
+    media_name=_discord_media_name(torrent,release)
+    embed={"title":f"⚠️ Erreur d'analyse — {media_name}","description":"ForcedFR n'a pas pu déterminer le résultat de manière fiable.","color":16776960,"fields":fields,"footer":{"text":"ForcedFR • Erreur d'analyse"}}
+    send_discord_message(embeds=[embed],torrent_hash=torrent_hash,release=release,decision_required=decision_required)
 
 
 def apply_analysis_error_policy(torrent: dict[str, Any], error: str, error_count: int) -> bool:
-    profile,release=_error_profile_for_torrent(torrent)
-    policy=str(profile.get("error_action") or "notify_continue")
-    retries=max(1,min(20,int(profile.get("error_retries") or 5)))
-    delay=max(1.0,min(3600.0,float(profile.get("error_retry_delay") or 30)))
-    if policy in {"retry_pause","retry_continue"} and error_count <= retries:
-        notify_analysis_error(torrent,error,action_text=f"🔄 Nouvelle tentative dans {delay:g} seconde(s) ({error_count}/{retries}).",attempt=error_count,release=release)
-        time.sleep(delay); return True
-    if policy=="retry_pause":
-        stop_torrent(str(torrent.get("hash",""))); text="⏸️ Après les tentatives prévues, le téléchargement a été mis en pause."
-    elif policy=="retry_continue":
-        start_torrent(str(torrent.get("hash",""))); text="▶️ Après les tentatives prévues, le téléchargement continue."
+    profile,release=_error_profile_for_torrent(torrent); policy=str(profile.get("error_action") or "resume")
+    retries=max(1,min(20,int(profile.get("error_retries") or 5))); delay=max(1.0,min(3600.0,float(profile.get("error_retry_delay") or 30)))
+    if policy in {"retry_pause_decision","retry_pause"} and error_count <= retries:
+        notify_analysis_error(torrent,error,action_text=f"🔄 Nouvelle tentative dans {delay:g} seconde(s) ({error_count}/{retries}).",attempt=error_count,release=release); time.sleep(delay); return True
+    if policy in {"retry_pause_decision","retry_pause"}:
+        stop_torrent(str(torrent.get("hash",""))); text="⏸️ Après les tentatives prévues, le téléchargement reste en pause. Une décision est demandée dans Discord."; notify_analysis_error(torrent,error,action_text=text,attempt=error_count,release=release,decision_required=True)
+    elif policy in {"retry_resume","retry_continue"}:
+        start_torrent(str(torrent.get("hash",""))); text="▶️ Après les tentatives prévues, le téléchargement a été repris automatiquement."; notify_analysis_error(torrent,error,action_text=text,attempt=error_count,release=release)
     elif policy=="pause_decision":
-        stop_torrent(str(torrent.get("hash",""))); text="⏸️ Le téléchargement est en pause. Utilise les boutons Discord pour décider de continuer ou de le laisser en pause."
+        stop_torrent(str(torrent.get("hash",""))); text="⏸️ Le téléchargement reste en pause. Une décision est demandée dans Discord."; notify_analysis_error(torrent,error,action_text=text,attempt=error_count,release=release,decision_required=True)
     else:
-        text="▶️ Le téléchargement continue. Une vérification manuelle est recommandée."
-    notify_analysis_error(torrent,error,action_text=text,attempt=error_count,release=release); return False
+        start_torrent(str(torrent.get("hash",""))); text="▶️ Le téléchargement a été repris automatiquement malgré l'erreur d'analyse."; notify_analysis_error(torrent,error,action_text=text,attempt=error_count,release=release)
+    return False
 
 
 # ============================================================
@@ -1658,17 +1484,17 @@ def _ai_cache_put(media_type: str, title: str, result: dict[str, Any]) -> None:
 
 
 def _brave_search(title: str, media_type: str) -> list[dict[str, str]]:
-    key = BRAVE_SEARCH_API_KEY or _setting("config_BRAVE_SEARCH_API_KEY", "")
-    if not key:
-        raise RuntimeError("Clé Brave Search non configurée.")
-    count = max(1, min(10, int(_setting("brave_results_count", str(BRAVE_RESULTS_COUNT)) or BRAVE_RESULTS_COUNT)))
-    queries = [f'"{title}" forced subtitles French', f'"{title}" "French forced subtitles"']
+    key=BRAVE_SEARCH_API_KEY or _setting("config_BRAVE_SEARCH_API_KEY","")
+    if not key: raise RuntimeError("Clé Brave Search non configurée.")
+    count=max(1,min(10,int(_setting("brave_results_count",str(BRAVE_RESULTS_COUNT)) or BRAVE_RESULTS_COUNT)))
+    queries=[f'"{title}" Blu-ray France subtitles forced',f'"{title}" DVD France sous-titres forced',f'"{title}" "French forced subtitles" Blu-ray',f'"{title}" Blu-ray.com subtitles']
+    preferred=("blu-ray.com","dvdcompare.net")
     results=[]; seen=set()
     for q in queries:
-        r=requests.get("https://api.search.brave.com/res/v1/web/search", headers={"Accept":"application/json","X-Subscription-Token":key}, params={"q":q,"count":count}, timeout=15)
-        r.raise_for_status()
-        data=r.json()
-        for item in (data.get("web",{}).get("results",[]) or []):
+        r=requests.get("https://api.search.brave.com/res/v1/web/search",headers={"Accept":"application/json","X-Subscription-Token":key},params={"q":q,"count":max(count,8)},timeout=15); r.raise_for_status(); data=r.json()
+        batch=data.get("web",{}).get("results",[]) or []
+        batch=sorted(batch,key=lambda x:0 if any(d in str(x.get("url") or "").lower() for d in preferred) else 1)
+        for item in batch:
             url=str(item.get("url") or "").strip()
             if not url or url in seen: continue
             seen.add(url); results.append({"title":str(item.get("title") or ""),"url":url,"description":str(item.get("description") or "")[:1200]})
@@ -1676,14 +1502,13 @@ def _brave_search(title: str, media_type: str) -> list[dict[str, str]]:
     if not results: raise RuntimeError("Brave n'a retourné aucun résultat pertinent.")
     return results
 
-
 def _groq_generate(media_type: str, title: str, search_results: list[dict[str,str]], ffprobe_summary: dict[str,Any] | None = None) -> dict[str,Any]:
     key=GROQ_API_KEY or _setting("config_GROQ_API_KEY", "")
     model=GROQ_MODEL or _setting("config_GROQ_MODEL", "openai/gpt-oss-120b")
     if not key: raise RuntimeError("Clé Groq non configurée.")
     sources_text="\n\n".join(f"SOURCE {i+1}\nTitre: {x['title']}\nURL: {x['url']}\nRésumé: {x['description']}" for i,x in enumerate(search_results))
     probe=json.dumps(ffprobe_summary or {}, ensure_ascii=False)[:5000]
-    prompt=f"""Analyse si l'œuvre « {title} » ({media_type}) nécessite normalement des sous-titres français Forced. Tu dois t'appuyer sur les résultats Web fournis ci-dessous et ne rien inventer. Une piste FR Forced absente de cette release ne prouve pas à elle seule que les Forced sont inutiles. Cherche les indices de dialogues en langue étrangère ou de passages normalement sous-titrés en français dans les sources.\n\nInformations FFprobe:\n{probe}\n\nRésultats Brave:\n{sources_text}\n\nRetourne une décision parmi NÉCESSAIRE, NON NÉCESSAIRE ou INDETERMINÉ. NÉCESSAIRE seulement si les éléments sont suffisamment convaincants; INDETERMINÉ en cas de doute ou de version spécifique impossible à établir."""
+    prompt=f"""Analyse si l'œuvre « {title} » ({media_type}) nécessite normalement des sous-titres français Forced. Appuie-toi en priorité sur les éditions physiques françaises (Blu-ray/DVD), Blu-ray.com, DVDCompare et autres bases spécialisées home-cinéma. Les sites de streaming ne doivent pas être considérés comme preuve principale. Recherche la langue des dialogues, les passages en langue étrangère, les sous-titres français de ces passages, les informations d’édition et les différences éventuelles entre versions. Ne confonds pas une absence de piste Forced sur une release avec une absence de besoin de Forced. En cas d’informations contradictoires ou d’édition impossible à identifier, réponds INDETERMINÉ.\n\nInformations FFprobe:\n{probe}\n\nRésultats Brave:\n{sources_text}\n\nRetourne une décision parmi NÉCESSAIRE, NON NÉCESSAIRE ou INDETERMINÉ avec une confiance de 0 à 1 et une justification courte."""
     schema={"type":"object","properties":{"recommendation":{"type":"string","enum":["NÉCESSAIRE","NON NÉCESSAIRE","INDETERMINÉ"]},"confidence":{"type":"number","minimum":0,"maximum":1},"justification":{"type":"string"},"sources":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"url":{"type":"string"}},"required":["title","url"],"additionalProperties":False}}},"required":["recommendation","confidence","justification","sources"],"additionalProperties":False}
     payload={"model":model,"messages":[{"role":"system","content":"Tu es un analyste expert des sous-titres Forced. Réponds uniquement avec le JSON demandé."},{"role":"user","content":prompt}],"temperature":0,"response_format":{"type":"json_schema","json_schema":{"name":"forcedfr_decision","strict":True,"schema":schema}},"max_tokens":700}
     last=None
@@ -1746,32 +1571,20 @@ def _normalize_ai_decision(media_type: str, result: dict[str, Any]) -> tuple[str
 
 def _apply_ai_action(torrent: dict[str,Any], profile: dict[str,Any], decision: str, ai_result: dict[str,Any], release: dict[str,Any] | None) -> str:
     action_key={"NÉCESSAIRE":"ai_necessary_action","NON NÉCESSAIRE":"ai_not_necessary_action","INDETERMINÉ":"ai_indeterminate_action"}.get(decision,"ai_indeterminate_action")
-    action=str(profile.get(action_key) or "pause_decision")
-    h=str(torrent.get("hash","")); name=str(torrent.get("name", ""))
-    confidence=float(ai_result.get("confidence") or 0)
-    justification=str(ai_result.get("justification") or "").strip()
-    if action=="continue_notify":
-        start_torrent(h); text=f"▶️ Téléchargement poursuivi après décision IA : **{decision}** ({confidence:.0%})."
-        record_torrent_action(h,"resume",source="ai",details=f"Décision IA {decision}: {justification[:500]}")
-    elif action=="pause_decision":
-        stop_torrent(h); text=f"⏸️ Torrent laissé en pause. Décision IA : **{decision}** ({confidence:.0%}). Une décision Discord est demandée."
-        record_torrent_action(h,"auto_pause",source="ai",details=f"Décision IA {decision}: {justification[:500]}")
-    elif action=="validate_notify":
-        text=f"🔔 Torrent validé après décision IA : **{decision}** ({confidence:.0%})."
-    else:
-        stop_torrent(h); text=f"⏸️ Torrent laissé en pause après décision IA : **{decision}** ({confidence:.0%})."
-        record_torrent_action(h,"auto_pause",source="ai",details=f"Décision IA {decision}: {justification[:500]}")
-    fields=f"**Décision :** {decision}\n**Confiance :** {confidence:.0%}\n\n{justification or 'Aucune justification fournie.'}"
-    notify_profile_decision(torrent,"🤖 Décision IA ForcedFR",fields,text,release)
+    action=str(profile.get(action_key) or "pause_decision"); h=str(torrent.get("hash","")); confidence=float(ai_result.get("confidence") or 0); justification=str(ai_result.get("justification") or "")
+    if action=="resume": start_torrent(h); text=f"▶️ Téléchargement repris après décision IA : **{decision}** ({confidence:.0%})."; record_torrent_action(h,"resume",source="ai",details=f"Décision IA {decision}: {justification[:500]}"); notify=False
+    elif action=="resume_notify": start_torrent(h); text=f"▶️ Téléchargement repris après décision IA : **{decision}** ({confidence:.0%})."; record_torrent_action(h,"resume",source="ai",details=f"Décision IA {decision}: {justification[:500]}"); notify=True
+    else: stop_torrent(h); text=f"⏸️ Téléchargement laissé en pause après décision IA : **{decision}** ({confidence:.0%})."; record_torrent_action(h,"auto_pause",source="ai",details=f"Décision IA {decision}: {justification[:500]}"); notify=True
+    if notify:
+        fields=f"**Décision :** {decision}\n**Confiance :** {confidence:.0%}\n\n{justification or 'Aucune justification fournie.'}"; notify_profile_decision(torrent,"🤖 Décision IA ForcedFR",fields,text,release,decision_required=(action=="pause_decision"))
     return text
 
 
 def _apply_ai_failure(torrent: dict[str,Any], error: str, release: dict[str,Any] | None) -> str:
-    h=str(torrent.get("hash","")); name=str(torrent.get("name",""))
-    stop_torrent(h)
-    text="⏸️ Torrent laissé en pause : décision IA impossible."
+    h=str(torrent.get("hash","")); stop_torrent(h)
+    text="⏸️ Le téléchargement reste en pause. Une décision est demandée dans Discord après l'échec de l'analyse IA/Web."
     record_torrent_action(h,"auto_pause",source="ai",details=str(error)[:1000])
-    notify_analysis_error(torrent,error,action_text=text,release=release)
+    notify_analysis_error(torrent,error,action_text=text,release=release,decision_required=True)
     return text
 
 def process_new_torrent(
@@ -1905,19 +1718,20 @@ def process_new_torrent(
                         torrent_hash,
                     )
                     profile, release = _torrent_profile_for_torrent(torrent)
-                    found_action = str(profile.get("found_action") or "validate")
+                    found_action = str(profile.get("found_action") or "resume")
                     name = str(torrent.get("name", ""))
-                    if found_action == "pause_notify":
-                        stop_torrent(torrent_hash)
-                        action_text = "⏸️ Torrent mis en pause. Forced FR détecté."
-                        record_torrent_action(torrent_hash, "auto_pause", source="forcedfr", details="Pause après détection d'une piste FR Forced.")
-                        notify_profile_decision(torrent, "🇫🇷 Forced FR détecté", f"Une piste française Forced a été détectée dans **{name}**.", action_text, release)
-                    elif found_action == "validate_notify":
-                        action_text = "🔔 Torrent validé et notification envoyée. Le téléchargement poursuit son cours."
-                        notify_profile_decision(torrent, "🇫🇷 Forced FR détecté", f"Une piste française Forced a été détectée dans **{name}**.", action_text, release)
+                    if found_action == "pause_decision":
+                        stop_torrent(torrent_hash); action_text="⏸️ Téléchargement laissé en pause. Une décision est demandée dans Discord."
+                        record_torrent_action(torrent_hash,"auto_pause",source="forcedfr",details="Pause après détection d'une piste FR Forced.")
+                        notify_profile_decision(torrent,"🇫🇷 Forced FR détecté","Une piste française Forced a été détectée.",action_text,release,decision_required=True)
+                    elif found_action == "resume_notify":
+                        start_torrent(torrent_hash); action_text="▶️ Téléchargement repris. Forced FR détecté."
+                        record_torrent_action(torrent_hash,"resume",source="forcedfr",details="Téléchargement poursuivi après détection d'une piste FR Forced.")
+                        notify_profile_decision(torrent,"🇫🇷 Forced FR détecté","Une piste française Forced a été détectée.",action_text,release)
                     else:
-                        action_text = "✓️ Torrent validé. Le téléchargement poursuit son cours."
-                    record_analysis_history(torrent_hash, name, "forced_found", action_text)
+                        start_torrent(torrent_hash); action_text="▶️ Téléchargement repris. Forced FR détecté."
+                        record_torrent_action(torrent_hash,"resume",source="forcedfr",details="Téléchargement poursuivi après détection d'une piste FR Forced.")
+                    record_analysis_history(torrent_hash,name,"forced_found",action_text)
                     return
 
                 # ------------------------------------------------
@@ -1941,23 +1755,15 @@ def process_new_torrent(
                 record_torrent_action(torrent_hash, "auto_pause", source="ai", details="Pause avant recherche Brave/Groq après absence de FR Forced.")
                 log.info("[%s] ⏸️ Torrent mis en pause avant la décision IA.", torrent_hash)
 
-                media_type = str(profile.get("media_type") or ("Série" if "series" in name.lower() else "Film"))
-
-                # Si l'IA est désactivée, on conserve exactement le comportement
-                # historique de la v2.5.14 pour une absence de FR Forced.
-                if not AI_ENABLED or not _setting_bool("ai_enabled", True):
-                    missing_action = str(profile.get("torrent_missing_action") or "pause_notify")
-                    if missing_action == "continue_notify":
-                        start_torrent(torrent_hash)
-                        action_text = "▶️ Téléchargement poursuivi. Aucune piste FR Forced détectée."
-                        record_torrent_action(torrent_hash, "resume", source="forcedfr", details="Téléchargement poursuivi après analyse sans piste FR Forced.")
-                    elif missing_action == "pause_decision":
-                        action_text = "⏸️ Torrent laissé en pause. Une décision est demandée dans Discord."
-                    else:
-                        action_text = "⏸️ Torrent laissé en pause. Aucune piste FR Forced détectée."
-                    notify_profile_decision(torrent, "🚨 Aucun Forced FR détecté", f"Aucune piste française Forced n'a été trouvée dans **{name}**.", action_text, release)
-                    record_analysis_history(torrent_hash, name, "no_forced", action_text)
-                    return
+                media_type = str(profile.get("media_type") or ("Série" if re.search(r"S\d{1,2}E\d{1,3}", name, re.I) else "Film"))
+                missing_action = str(profile.get("torrent_missing_action") or "scan_ai")
+                if missing_action != "scan_ai":
+                    if missing_action == "resume":
+                        start_torrent(torrent_hash); action_text="▶️ Téléchargement repris. Aucune piste FR Forced détectée."; record_torrent_action(torrent_hash,"resume",source="forcedfr",details="Reprise après absence de FR Forced."); record_analysis_history(torrent_hash,name,"no_forced",action_text); return
+                    if missing_action == "resume_notify":
+                        start_torrent(torrent_hash); action_text="▶️ Téléchargement repris. Aucune piste FR Forced détectée."; record_torrent_action(torrent_hash,"resume",source="forcedfr",details="Reprise après absence de FR Forced."); notify_profile_decision(torrent,"🇫🇷 Forced FR absent","Aucune piste française Forced n'a été détectée.",action_text,release); record_analysis_history(torrent_hash,name,"no_forced",action_text); return
+                    stop_torrent(torrent_hash); action_text="⏸️ Téléchargement laissé en pause. Une décision est demandée dans Discord."; record_torrent_action(torrent_hash,"auto_pause",source="forcedfr",details="Pause après absence de FR Forced."); notify_profile_decision(torrent,"🇫🇷 Forced FR absent","Aucune piste française Forced n'a été détectée.",action_text,release,decision_required=True); record_analysis_history(torrent_hash,name,"no_forced",action_text); return
+                stop_torrent(torrent_hash); record_torrent_action(torrent_hash,"auto_pause",source="ai",details="Pause avant recherche Brave/Groq après absence de FR Forced."); log.info("[%s] ⏸️ Torrent laissé en pause pendant la décision IA.",torrent_hash)
 
                 try:
                     ai_result = research_forced_fr_with_ai(torrent, media_type, name, result)
@@ -2248,6 +2054,42 @@ async def monitor_qbittorrent() -> None:
         )
 
 
+
+async def _discord_lifecycle_loop() -> None:
+    while True:
+        try:
+            if discord_bot is not None and discord_bot.is_ready() and DISCORD_CHANNEL_ID:
+                now=time.time()
+                with _db_connect() as conn: rows=conn.execute("SELECT * FROM discord_messages WHERE resolved=0 AND deleted_at IS NULL ORDER BY sent_at ASC LIMIT 200").fetchall()
+                channel=discord_bot.get_channel(int(DISCORD_CHANNEL_ID))
+                if channel is None: channel=await discord_bot.fetch_channel(int(DISCORD_CHANNEL_ID))
+                for row in rows:
+                    age=now-float(row["sent_at"])
+                    try: msg=await channel.fetch_message(int(row["message_id"]))
+                    except Exception:
+                        with _db_connect() as conn: conn.execute("UPDATE discord_messages SET deleted_at=? WHERE message_id=?",(now,str(row["message_id"])))
+                        continue
+                    if int(row["decision_required"]):
+                        if age>=48*3600:
+                            try: await msg.delete()
+                            except Exception: pass
+                            with _db_connect() as conn: conn.execute("UPDATE discord_messages SET deleted_at=? WHERE message_id=?",(now,str(row["message_id"])))
+                        elif age>=24*3600 and not int(row["reminder_sent"]):
+                            try:
+                                embeds=[]
+                                for e in msg.embeds:
+                                    d=e.to_dict(); d["description"]=(d.get("description") or "")+"\n\n⏰ **Rappel : une décision est toujours nécessaire.**"; embeds.append(d)
+                                await msg.edit(embeds=embeds or None)
+                            except Exception: log.exception("Impossible de relancer le message Discord %s.",row["message_id"])
+                            with _db_connect() as conn: conn.execute("UPDATE discord_messages SET reminder_sent=1 WHERE message_id=?",(str(row["message_id"]),))
+                    elif age>=24*3600:
+                        try: await msg.delete()
+                        except Exception: pass
+                        with _db_connect() as conn: conn.execute("UPDATE discord_messages SET deleted_at=? WHERE message_id=?",(now,str(row["message_id"])))
+        except asyncio.CancelledError: raise
+        except Exception: log.exception("Erreur dans le nettoyage des messages Discord.")
+        await asyncio.sleep(300)
+
 # ============================================================
 # STARTUP
 # ============================================================
@@ -2255,7 +2097,7 @@ async def monitor_qbittorrent() -> None:
 @app.on_event("startup")
 async def startup() -> None:
 
-    global MAIN_EVENT_LOOP, discord_bot
+    global MAIN_EVENT_LOOP, discord_bot, discord_lifecycle_task
     MAIN_EVENT_LOOP = asyncio.get_running_loop()
 
     log.info(
@@ -2300,6 +2142,8 @@ async def startup() -> None:
         discord_bot = build_discord_bot()
         asyncio.create_task(discord_bot.start(DISCORD_BOT_TOKEN))
 
+    discord_lifecycle_task=asyncio.create_task(_discord_lifecycle_loop())
+
     asyncio.create_task(
         monitor_qbittorrent()
     )
@@ -2315,7 +2159,10 @@ async def startup() -> None:
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global discord_bot
+    global discord_bot, discord_lifecycle_task
+    if discord_lifecycle_task is not None:
+        discord_lifecycle_task.cancel()
+        discord_lifecycle_task=None
     if discord_bot is not None:
         try:
             await discord_bot.close()
@@ -2332,7 +2179,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.6.9",
+        "version": "2.6.10",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -2676,12 +2523,17 @@ def init_database() -> None:
             )
 
         conn.execute("""
+            CREATE TABLE IF NOT EXISTS discord_messages (
+                message_id TEXT PRIMARY KEY, channel_id TEXT NOT NULL, torrent_hash TEXT NOT NULL, decision_required INTEGER NOT NULL DEFAULT 0, sent_at REAL NOT NULL, reminder_sent INTEGER NOT NULL DEFAULT 0, resolved INTEGER NOT NULL DEFAULT 0, deleted_at REAL
+            )
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS forcedfr_profiles (
                 name TEXT PRIMARY KEY,
                 media_type TEXT NOT NULL,
                 forced_required INTEGER NOT NULL DEFAULT 1,
                 missing_action TEXT NOT NULL DEFAULT 'review',
-                error_action TEXT NOT NULL DEFAULT 'notify_continue',
+                error_action TEXT NOT NULL DEFAULT 'resume',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at REAL NOT NULL
             )
@@ -2689,7 +2541,7 @@ def init_database() -> None:
         for name, media_type in (("strict", "Film"), ("strict_series", "Série")):
             conn.execute(
                 "INSERT OR IGNORE INTO forcedfr_profiles(name,media_type,forced_required,missing_action,error_action,enabled,updated_at) VALUES (?,?,?,?,?,?,?)",
-                (name, media_type, 1, "review", "notify_continue", 1, time.time()),
+                (name, media_type, 1, "review", "resume", 1, time.time()),
             )
         cols = {row[1] for row in conn.execute("PRAGMA table_info(forcedfr_profiles)").fetchall()}
         if "error_retries" not in cols:
@@ -2697,15 +2549,28 @@ def init_database() -> None:
         if "error_retry_delay" not in cols:
             conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN error_retry_delay REAL NOT NULL DEFAULT 30")
         if "found_action" not in cols:
-            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN found_action TEXT NOT NULL DEFAULT 'validate'")
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN found_action TEXT NOT NULL DEFAULT 'resume'")
         if "torrent_missing_action" not in cols:
-            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN torrent_missing_action TEXT NOT NULL DEFAULT 'pause_notify'")
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN torrent_missing_action TEXT NOT NULL DEFAULT 'scan_ai'")
         if "ai_necessary_action" not in cols:
-            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN ai_necessary_action TEXT NOT NULL DEFAULT 'pause_notify'")
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN ai_necessary_action TEXT NOT NULL DEFAULT 'pause_decision'")
         if "ai_not_necessary_action" not in cols:
-            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN ai_not_necessary_action TEXT NOT NULL DEFAULT 'continue_notify'")
+            conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN ai_not_necessary_action TEXT NOT NULL DEFAULT 'resume_notify'")
         if "ai_indeterminate_action" not in cols:
             conn.execute("ALTER TABLE forcedfr_profiles ADD COLUMN ai_indeterminate_action TEXT NOT NULL DEFAULT 'pause_decision'")
+        conn.execute("UPDATE forcedfr_profiles SET found_action='resume' WHERE found_action='validate'")
+        conn.execute("UPDATE forcedfr_profiles SET found_action='resume_notify' WHERE found_action='validate_notify'")
+        conn.execute("UPDATE forcedfr_profiles SET found_action='pause_decision' WHERE found_action='pause_notify'")
+        conn.execute("UPDATE forcedfr_profiles SET torrent_missing_action='scan_ai' WHERE torrent_missing_action IN ('pause_notify','continue_notify')")
+        conn.execute("UPDATE forcedfr_profiles SET ai_necessary_action='pause_decision' WHERE ai_necessary_action IN ('pause_notify','validate_notify')")
+        conn.execute("UPDATE forcedfr_profiles SET ai_necessary_action='resume_notify' WHERE ai_necessary_action='continue_notify'")
+        conn.execute("UPDATE forcedfr_profiles SET ai_not_necessary_action='resume_notify' WHERE ai_not_necessary_action='continue_notify'")
+        conn.execute("UPDATE forcedfr_profiles SET ai_not_necessary_action='pause_decision' WHERE ai_not_necessary_action='pause_notify'")
+        conn.execute("UPDATE forcedfr_profiles SET ai_indeterminate_action='pause_decision' WHERE ai_indeterminate_action IN ('pause_notify','validate_notify')")
+        conn.execute("UPDATE forcedfr_profiles SET ai_indeterminate_action='resume_notify' WHERE ai_indeterminate_action='continue_notify'")
+        conn.execute("UPDATE forcedfr_profiles SET error_action='resume' WHERE error_action='notify_continue'")
+        conn.execute("UPDATE forcedfr_profiles SET error_action='retry_resume' WHERE error_action='retry_continue'")
+        conn.execute("UPDATE forcedfr_profiles SET error_action='retry_pause_decision' WHERE error_action='retry_pause'")
     log.info("SQLite initialisée : %s", SQLITE_PATH)
 
 
@@ -3356,7 +3221,7 @@ def _torrent_profile_for_torrent(torrent: dict[str, Any]) -> tuple[dict[str, Any
     media_type = str((release or {}).get("media_type") or "")
     if not media_type:
         media_type = "Série" if re.search(r"S\d{1,2}E\d{1,3}", str(torrent.get("name", "")), re.I) else "Film"
-    return (_profile_for_media(media_type) or {"media_type": media_type, "found_action": "validate", "torrent_missing_action": "pause_notify"}, release)
+    return (_profile_for_media(media_type) or {"media_type": media_type, "found_action": "resume", "torrent_missing_action": "scan_ai"}, release)
 
 
 def _error_profile_for_torrent(torrent: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
@@ -3364,7 +3229,7 @@ def _error_profile_for_torrent(torrent: dict[str, Any]) -> tuple[dict[str, Any],
     try: release=wait_for_release_context(str(torrent.get("hash","")))
     except Exception: pass
     media_type="Série" if release and release.get("source")=="Sonarr" else "Film"
-    return (_profile_for_media(media_type) or {"media_type":media_type,"error_action":"notify_continue","error_retries":5,"error_retry_delay":30},release)
+    return (_profile_for_media(media_type) or {"media_type":media_type,"error_action":"resume","error_retries":5,"error_retry_delay":30},release)
 
 
 def _review_status_from_profile(media_type: str) -> str:
@@ -3509,7 +3374,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.6.9</title>
+<title>ForcedFR v2.6.10</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -3525,7 +3390,7 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 .settings-grid{display:grid;grid-template-columns:minmax(290px,.8fr) minmax(0,1.5fr);gap:18px;align-items:start}.settings-card{padding:19px}.settings-card h3{margin:0 0 6px}.settings-card .desc{color:var(--muted);font-size:.84rem;line-height:1.5;margin:0 0 16px}.setting-item{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:14px 0;border-top:1px solid var(--border)}.setting-item:first-of-type{border-top:0}.setting-copy strong{display:block;font-size:.85rem}.setting-copy span{display:block;color:var(--muted);font-size:.76rem;margin-top:4px}.switch{position:relative;width:44px;height:24px;flex:0 0 auto}.switch input{display:none}.switch span{position:absolute;inset:0;background:#2b3542;border-radius:999px;cursor:pointer;transition:.2s}.switch span:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}.switch input:checked+span{background:var(--green)}.switch input:checked+span:before{transform:translateX(20px)}.savebar{display:flex;justify-content:flex-end;margin-top:17px}.profile-list{display:grid;gap:12px}.profile-card{background:rgba(21,29,39,.76);border:1px solid var(--border);border-radius:13px;padding:17px}.profile-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}.profile-name{font-size:.98rem;font-weight:850}.profile-type{color:var(--muted);font-size:.76rem;margin-top:3px}.profile-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.profile-field{display:flex;flex-direction:column;gap:7px}.profile-field label{color:var(--muted);font-size:.68rem;text-transform:uppercase;font-weight:800;letter-spacing:.05em}.profile-field select{width:100%;min-width:0}.profile-footer{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-top:15px;padding-top:14px;border-top:1px solid var(--border)}.status-pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:5px 9px;background:#202a36;font-size:.72rem;font-weight:800}.status-pill.on{color:var(--green)}.status-pill.off{color:var(--muted)}.settings-title{margin-top:0;margin-bottom:12px}.settings-title h2{margin-bottom:4px}.settings-title p{margin:0}.tag-list{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px}.tag-chip{border:1px solid var(--border);background:#202a36;color:#e8edf2;border-radius:999px;padding:6px 10px;cursor:pointer;font-size:.75rem}.tag-chip:hover{border-color:var(--accent)}.tag-chip.selected{background:rgba(72,184,128,.14);border-color:var(--green);color:#fff;box-shadow:0 0 0 1px rgba(72,184,128,.12) inset}.retry-fields{grid-template-columns:1fr 1fr;gap:8px;margin-top:9px}.retry-fields label{font-size:.68rem;color:var(--muted);text-transform:uppercase;font-weight:800}.retry-fields input{margin-top:5px}
 @media(max-width:1000px){.services{grid-template-columns:repeat(3,1fr)}.settings-grid{grid-template-columns:1fr}.profile-grid{grid-template-columns:repeat(3,1fr)}}@media(max-width:720px){main{padding:22px 15px 40px}.services{grid-template-columns:1fr 1fr}.app-header{align-items:flex-start}.tabs{overflow:auto;flex-wrap:nowrap}.tab{white-space:nowrap}.activity-row{grid-template-columns:1fr;gap:5px}.profile-grid{grid-template-columns:1fr 1fr}.profile-footer{align-items:flex-start;flex-direction:column}.savebar{justify-content:stretch}.savebar button{width:100%}.media-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:480px){.services{grid-template-columns:1fr}.profile-grid{grid-template-columns:1fr}.version{display:none}.media-grid{grid-template-columns:1fr 1fr}}
 </style></head><body><main>
-<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.6.9</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
+<header class="app-header"><div><div class="brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="ffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#5b8cff"/><stop offset="1" stop-color="#7b68ee"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#ffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#35c98a" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><p class="sub">Surveillance des téléchargements et contrôle des bibliothèques.</p></div></div></div><div class="version">v2.6.10</div></header><p class="sub">Surveillance qBittorrent et contrôle des bibliothèques Radarr / Sonarr.</p>
 <div class="services">
 <div class="service-card"><div class="service-icon">✓</div><div><div class="service-name">ForcedFR</div><div class="service-meta"><span class="status-dot online"></span> Service actif</div></div></div>
 <div class="service-card"><div class="service-icon"><img src="https://cdn.simpleicons.org/qbittorrent" alt="qBittorrent"></div><div><div class="service-name">qBittorrent</div><div class="service-meta value" id="qb">…</div></div></div>
@@ -3566,7 +3431,7 @@ table{width:100%;border-collapse:collapse;min-width:650px}th,td{padding:12px 14p
 <div class="profile-card"><div class="profile-name">🎬 Films</div><div class="profile-grid"><label class="profile-field"><span>🟢 NÉCESSAIRE — confiance minimale (%)</span><input id="confFilmsNecessary" type="number" min="0" max="100"></label><label class="profile-field"><span>🔵 NON NÉCESSAIRE — confiance minimale (%)</span><input id="confFilmsNotNecessary" type="number" min="0" max="100"></label></div></div>
 <div class="profile-card" style="margin-top:12px"><div class="profile-name">📺 Séries</div><div class="profile-grid"><label class="profile-field"><span>🟢 NÉCESSAIRE — confiance minimale (%)</span><input id="confSeriesNecessary" type="number" min="0" max="100"></label><label class="profile-field"><span>🔵 NON NÉCESSAIRE — confiance minimale (%)</span><input id="confSeriesNotNecessary" type="number" min="0" max="100"></label></div></div>
 <div class="savebar"><button class="primary" onclick="saveAISettings()">💾 Enregistrer l’IA</button></div></div>
-<div class="settings-card" style="margin-top:18px"><h3>🔔 Notifications</h3><div class="setting-item"><div class="setting-copy"><strong>Forced FR absent</strong><span>Notifier les décisions / absences de Forced FR.</span></div><label class="switch"><input type="checkbox" id="setNoForced"><span></span></label></div><div class="setting-item"><div class="setting-copy"><strong>Erreur d’analyse</strong><span>Notifier les erreurs FFprobe ou IA.</span></div><label class="switch"><input type="checkbox" id="setErrors"><span></span></label></div></div>
+
 </div>
 <div>
 <div class="settings-card"><h3>🎬 Profil Films</h3><p class="desc">Chaque décision IA possède sa propre action.</p><div id="profileFilm"></div></div>
@@ -3644,17 +3509,17 @@ $('qbTagsAvailable').innerHTML='<span class="small">Impossible de récupérer le
 }
 
 async function loadSettings(){const [s,p,c]=await Promise.all([api('/settings'),api('/profiles'),api('/configuration')]);
-$('setAIEnabled').checked=s.ai_enabled;$('setNoForced').checked=s.notify_no_forced;$('setErrors').checked=s.notify_errors;$('cfgBraveResults').value=s.brave_results_count;$('confFilmsNecessary').value=s.ai_confidence.films.necessary;$('confFilmsNotNecessary').value=s.ai_confidence.films.not_necessary;$('confSeriesNecessary').value=s.ai_confidence.series.necessary;$('confSeriesNotNecessary').value=s.ai_confidence.series.not_necessary;
+$('setAIEnabled').checked=s.ai_enabled;$('cfgBraveResults').value=s.brave_results_count;$('confFilmsNecessary').value=s.ai_confidence.films.necessary;$('confFilmsNotNecessary').value=s.ai_confidence.films.not_necessary;$('confSeriesNecessary').value=s.ai_confidence.series.necessary;$('confSeriesNotNecessary').value=s.ai_confidence.series.not_necessary;
 $('cfgQBHost').value=c.values.QB_HOST||'';$('cfgQBUsername').value=c.values.QB_USERNAME||'';$('cfgQBPassword').value=c.values.QB_PASSWORD||'';$('cfgRadarrUrl').value=c.values.RADARR_URL||'';$('cfgRadarrKey').value=c.values.RADARR_API_KEY||'';$('cfgSonarrUrl').value=c.values.SONARR_URL||'';$('cfgSonarrKey').value=c.values.SONARR_API_KEY||'';$('cfgDiscordToken').value=c.values.DISCORD_BOT_TOKEN||'';$('cfgDiscordChannel').value=c.values.DISCORD_CHANNEL_ID||'';$('cfgDiscordWebhook').value=c.values.DISCORD_WEBHOOK_URL||'';$('cfgTZ').value=c.values.TZ||'';$('cfgGroqKey').value=c.values.GROQ_API_KEY||'';$('cfgGroqModel').value=c.values.GROQ_MODEL||'';$('cfgBraveKey').value=c.values.BRAVE_SEARCH_API_KEY||'';$('cfgQBIgnoredTags').value=s.qb_ignored_tags||'';loadQbTags();
 const film=p.results.find(i=>i.media_type==='Film')||p.results[0];const series=p.results.find(i=>i.media_type==='Série')||p.results[1]||p.results[0];if(film)$('profileFilm').innerHTML=profileEditor(film);if(series)$('profileSeries').innerHTML=profileEditor(series);$('profileErrors').innerHTML='<div class="small">Les options d’erreur sont disponibles dans chaque profil ci-dessus.</div>';
 }
-function profileEditor(i){const n=esc(i.name);return '<div class="profile-grid"><div class="profile-field"><label>Si FR Forced trouvée</label><select id="found-'+n+'"><option value="validate" '+(i.found_action==='validate'?'selected':'')+'>✓ Valider</option><option value="pause_notify" '+(i.found_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="validate_notify" '+(i.found_action==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option></select></div><div class="profile-field"><label>Si FR Forced absente avant IA</label><select id="tm-'+n+'"><option value="pause_notify" '+(i.torrent_missing_action==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue_notify" '+(i.torrent_missing_action==='continue_notify'?'selected':'')+'>▶ Continuer le téléchargement + notifier Discord</option><option value="pause_decision" '+(i.torrent_missing_action==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option></select></div><div class="profile-field"><label>Après scan bibliothèque</label><select id="miss-'+n+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div></div><div class="profile-card" style="margin-top:12px"><div class="profile-name">🤖 Décisions IA</div><div class="profile-grid"><div class="profile-field"><label>🟢 NÉCESSAIRE</label><select id="aiN-'+n+'">'+aiActionOptions(i.ai_necessary_action)+'</select></div><div class="profile-field"><label>🔵 NON NÉCESSAIRE</label><select id="aiNN-'+n+'">'+aiActionOptions(i.ai_not_necessary_action)+'</select></div><div class="profile-field"><label>🟠 INDETERMINÉ</label><select id="aiI-'+n+'">'+aiActionOptions(i.ai_indeterminate_action)+'</select></div></div></div><div class="profile-card" style="margin-top:12px"><div class="profile-name">⚠️ Erreur d’analyse</div><div class="profile-field"><label>Action</label><select id="err-'+n+'" onchange="toggleRetryFields('+JSON.stringify(i.name)+')"><option value="notify_continue" '+(i.error_action==='notify_continue'?'selected':'')+'>▶ Continuer le téléchargement + notifier</option><option value="pause_decision" '+(i.error_action==='pause_decision'?'selected':'')+'>⏸ Laisser en pause + demander une décision</option><option value="retry_pause" '+(i.error_action==='retry_pause'?'selected':'')+'>🔄 Réessayer puis laisser en pause</option><option value="retry_continue" '+(i.error_action==='retry_continue'?'selected':'')+'>🔄 Réessayer puis continuer</option></select><div class="retry-fields" id="retry-'+n+'" style="display:'+(i.error_action==='retry_pause'||i.error_action==='retry_continue'?'grid':'none')+'"><label>Nombre de tentatives<input type="number" min="1" max="20" id="retries-'+n+'" value="'+(i.error_retries||5)+'"></label><label>Délai entre tentatives (s)<input type="number" min="1" max="3600" id="delay-'+n+'" value="'+(i.error_retry_delay||30)+'"></label></div></div></div><div class="profile-footer"><label><input type="checkbox" id="ena-'+n+'" '+(i.enabled?'checked':'')+'> Profil actif</label><button type="button" class="primary" onclick="saveProfile('+JSON.stringify(i.name)+','+JSON.stringify(i.media_type)+','+(i.forced_required?'true':'false')+')">💾 Enregistrer le profil</button></div>'}
-function aiActionOptions(v){return '<option value="pause_notify" '+(v==='pause_notify'?'selected':'')+'>⏸ Laisser en pause + notifier Discord</option><option value="continue_notify" '+(v==='continue_notify'?'selected':'')+'>▶ Continuer le téléchargement + notifier Discord</option><option value="pause_decision" '+(v==='pause_decision'?'selected':'')+'>❓ Laisser en pause + demander une décision</option><option value="validate_notify" '+(v==='validate_notify'?'selected':'')+'>🔔 Valider + notifier Discord</option>'}
-function toggleRetryFields(name){const v=$('err-'+name).value;const box=$('retry-'+name);if(box)box.style.display=(v==='retry_pause'||v==='retry_continue')?'grid':'none'}
+function profileEditor(i){const n=esc(i.name);return '<div class="profile-grid"><div class="profile-field"><label>Si FR Forced trouvée</label><select id="found-'+n+'"><option value="resume" '+(i.found_action==='resume'?'selected':'')+'>▶️ Reprendre</option><option value="resume_notify" '+(i.found_action==='resume_notify'?'selected':'')+'>▶️ Reprendre + notif Discord</option><option value="pause_decision" '+(i.found_action==='pause_decision'?'selected':'')+'>⏸️ Laisser en pause + prise de décision</option></select></div><div class="profile-field"><label>Si FR Forced absente</label><select id="tm-'+n+'"><option value="scan_ai" '+(i.torrent_missing_action==='scan_ai'?'selected':'')+'>🤖 Scan IA</option><option value="resume" '+(i.torrent_missing_action==='resume'?'selected':'')+'>▶️ Reprendre</option><option value="resume_notify" '+(i.torrent_missing_action==='resume_notify'?'selected':'')+'>▶️ Reprendre + notif Discord</option><option value="pause_decision" '+(i.torrent_missing_action==='pause_decision'?'selected':'')+'>⏸️ Laisser en pause + prise de décision</option></select></div><div class="profile-field"><label>Après scan bibliothèque</label><select id="miss-'+n+'"><option value="review" '+(i.missing_action==='review'?'selected':'')+'>À traiter</option><option value="validated" '+(i.missing_action==='validated'?'selected':'')+'>Absence normale</option><option value="waiting_replacement" '+(i.missing_action==='waiting_replacement'?'selected':'')+'>Attendre une meilleure release</option></select></div></div><div class="profile-card" style="margin-top:12px"><div class="profile-name">🤖 Décisions IA</div><div class="profile-grid"><div class="profile-field"><label>🟢 NÉCESSAIRE</label><select id="aiN-'+n+'">'+aiActionOptions(i.ai_necessary_action)+'</select></div><div class="profile-field"><label>🔵 NON NÉCESSAIRE</label><select id="aiNN-'+n+'">'+aiActionOptions(i.ai_not_necessary_action)+'</select></div><div class="profile-field"><label>🟠 INDETERMINÉ</label><select id="aiI-'+n+'">'+aiActionOptions(i.ai_indeterminate_action)+'</select></div></div></div><div class="profile-card" style="margin-top:12px"><div class="profile-name">⚠️ Erreur d’analyse</div><div class="profile-field"><label>Action</label><select id="err-'+n+'" onchange="toggleRetryFields('+JSON.stringify(i.name)+')"><option value="resume" '+(i.error_action==='resume'?'selected':'')+'>▶️ Reprendre</option><option value="pause_decision" '+(i.error_action==='pause_decision'?'selected':'')+'>⏸️ Laisser en pause + prise de décision</option><option value="retry_resume" '+(i.error_action==='retry_resume'?'selected':'')+'>🔄 Réessayer puis Reprendre</option><option value="retry_pause_decision" '+(i.error_action==='retry_pause_decision'?'selected':'')+'>🔄 Réessayer puis laisser en pause + prise de décision</option></select><div class="retry-fields" id="retry-'+n+'" style="display:'+(i.error_action==='retry_pause_decision'||i.error_action==='retry_resume'?'grid':'none')+'"><label>Nombre de tentatives<input type="number" min="1" max="20" id="retries-'+n+'" value="'+(i.error_retries||5)+'"></label><label>Délai entre tentatives (s)<input type="number" min="1" max="3600" id="delay-'+n+'" value="'+(i.error_retry_delay||30)+'"></label></div></div></div><div class="profile-footer"><label><input type="checkbox" id="ena-'+n+'" '+(i.enabled?'checked':'')+'> Profil actif</label><button type="button" class="primary" onclick="saveProfile('+JSON.stringify(i.name)+','+JSON.stringify(i.media_type)+','+(i.forced_required?'true':'false')+')">💾 Enregistrer le profil</button></div>'}
+function aiActionOptions(v){return '<option value="resume" '+(v==='resume'?'selected':'')+'>▶️ Reprendre</option><option value="resume_notify" '+(v==='resume_notify'?'selected':'')+'>▶️ Reprendre + notif Discord</option><option value="pause_decision" '+(v==='pause_decision'?'selected':'')+'>⏸️ Laisser en pause + prise de décision</option>'}
+function toggleRetryFields(name){const v=$('err-'+name).value;const box=$('retry-'+name);if(box)box.style.display=(v==='retry_pause_decision'||v==='retry_resume')?'grid':'none'}
 async function saveProfile(name,mediaType,forcedRequired){try{await api('/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,media_type:mediaType,forced_required:forcedRequired,missing_action:$('miss-'+name).value,found_action:$('found-'+name).value,torrent_missing_action:$('tm-'+name).value,error_action:$('err-'+name).value,error_retries:parseInt($('retries-'+name)?.value||5,10),error_retry_delay:parseFloat($('delay-'+name)?.value||30),ai_necessary_action:$('aiN-'+name).value,ai_not_necessary_action:$('aiNN-'+name).value,ai_indeterminate_action:$('aiI-'+name).value,enabled:$('ena-'+name).checked})});alert('Profil enregistré.');loadSettings()}catch(e){alert(e.message)}}
-async function saveAISettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ai_enabled:$('setAIEnabled').checked,notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked,brave_results_count:parseInt($('cfgBraveResults').value||5,10),ai_necessary_min_confidence_films:parseFloat($('confFilmsNecessary').value||70),ai_not_necessary_min_confidence_films:parseFloat($('confFilmsNotNecessary').value||70),ai_necessary_min_confidence_series:parseFloat($('confSeriesNecessary').value||70),ai_not_necessary_min_confidence_series:parseFloat($('confSeriesNotNecessary').value||70),qb_ignored_tags:$('cfgQBIgnoredTags').value})});await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({GROQ_API_KEY:$('cfgGroqKey').value,GROQ_MODEL:$('cfgGroqModel').value,BRAVE_SEARCH_API_KEY:$('cfgBraveKey').value})});alert('Paramètres IA enregistrés.');loadSettings()}catch(e){alert(e.message)}}
+async function saveAISettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ai_enabled:$('setAIEnabled').checked,brave_results_count:parseInt($('cfgBraveResults').value||5,10),ai_necessary_min_confidence_films:parseFloat($('confFilmsNecessary').value||70),ai_not_necessary_min_confidence_films:parseFloat($('confFilmsNotNecessary').value||70),ai_necessary_min_confidence_series:parseFloat($('confSeriesNecessary').value||70),ai_not_necessary_min_confidence_series:parseFloat($('confSeriesNotNecessary').value||70),qb_ignored_tags:$('cfgQBIgnoredTags').value})});await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({GROQ_API_KEY:$('cfgGroqKey').value,GROQ_MODEL:$('cfgGroqModel').value,BRAVE_SEARCH_API_KEY:$('cfgBraveKey').value})});alert('Paramètres IA enregistrés.');loadSettings()}catch(e){alert(e.message)}}
 async function saveConnectionSettings(){try{await api('/configuration',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({QB_HOST:$('cfgQBHost').value,QB_USERNAME:$('cfgQBUsername').value,QB_PASSWORD:$('cfgQBPassword').value,RADARR_URL:$('cfgRadarrUrl').value,RADARR_API_KEY:$('cfgRadarrKey').value,SONARR_URL:$('cfgSonarrUrl').value,SONARR_API_KEY:$('cfgSonarrKey').value,DISCORD_BOT_TOKEN:$('cfgDiscordToken').value,DISCORD_CHANNEL_ID:$('cfgDiscordChannel').value,DISCORD_WEBHOOK_URL:$('cfgDiscordWebhook').value,TZ:$('cfgTZ').value})});alert('Connexions enregistrées. Redémarre ForcedFR pour appliquer le nouveau token Discord.');loadSettings();refresh()}catch(e){alert(e.message)}}
-async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({notify_no_forced:$('setNoForced').checked,notify_errors:$('setErrors').checked,qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
+async function saveSettings(){try{await api('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({qb_ignored_tags:$('cfgQBIgnoredTags').value})});alert('Paramètres enregistrés.')}catch(e){alert(e.message)}}
 $('historyFilter').onchange=renderHistory;$('historySearch').oninput=renderHistory;
 async function refresh(){try{const [s,x]=await Promise.all([api('/status'),api('/scan/status')]);st('qb',s.qbittorrent.status,s.qbittorrent.torrents!=null?'('+s.qbittorrent.torrents+')':'');st('discord',s.discord.status);st('radarr',s.radarr.status,s.radarr.version?'v'+s.radarr.version:'');st('sonarr',s.sonarr.status,s.sonarr.version?'v'+s.sonarr.version:'');const p=x.total_files?Math.round(x.processed_files/x.total_files*100):0;$('bar').style.width=p+'%';$('scanLabel').textContent=x.running?'Scan en cours : '+p+'%'+(x.current_file?' — '+x.current_file:''):(x.finished_at?'Dernier scan terminé.':'Aucun scan en cours.');$('stats').textContent='Analysés : '+x.processed_files+'/'+x.total_files+' • Avec FR Forced : '+x.files_with_forced_fr+' • Sans FR Forced : '+x.files_without_forced_fr+' • Cache : '+(x.cache_hits||0)+' • FFprobe : '+(x.reanalyzed||0)+' • Erreurs : '+x.errors;if(!loaded||(prev&&!x.running))await loadResults();prev=x.running;clearTimeout(timer);timer=setTimeout(refresh,x.running?5000:15000)}catch(e){console.error(e);clearTimeout(timer);timer=setTimeout(refresh,15000)}}(async()=>{try{await loadCached('all')}catch(e){console.error(e)}loadDashboard();refresh()})();
 </script></main></body></html>"""
@@ -3668,7 +3533,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.6.9",
+        "version": "2.6.10",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -3733,7 +3598,10 @@ def test_qbittorrent() -> dict[str, Any]:
         torrents = get_torrents()
         return {"ok": True, "message": f"qBittorrent connecté — {len(torrents)} torrent(s)."}
     except Exception as exc:
-        return {"ok": False, "message": f"qBittorrent : {exc} — vérifie l'URL, l'utilisateur et le mot de passe."}
+        text=str(exc)
+        if "IP bannie" in text or "HTTP 403" in text:
+            return {"ok": False, "message": f"qBittorrent : {text} Aucun nouvel essai automatique ne sera effectué."}
+        return {"ok": False, "message": f"qBittorrent : {text} — vérifie l'URL, l'utilisateur et le mot de passe."}
 
 
 @app.post("/test/radarr")
@@ -3836,8 +3704,6 @@ def qbittorrent_tags() -> dict[str, Any]:
 @app.get("/settings")
 def settings() -> dict[str, Any]:
     return {
-        "notify_no_forced": _setting_bool("notify_no_forced", True),
-        "notify_errors": _setting_bool("notify_errors", True),
         "qb_ignored_tags": _setting("qb_ignored_tags", ""),
         "ai_enabled": _setting_bool("ai_enabled", True),
         "brave_results_count": int(_setting("brave_results_count", "5") or 5),
@@ -3856,10 +3722,6 @@ def settings() -> dict[str, Any]:
 
 @app.post("/settings")
 def update_settings(payload: dict[str, Any]) -> dict[str, Any]:
-    if "notify_no_forced" in payload:
-        set_setting("notify_no_forced", "1" if bool(payload["notify_no_forced"]) else "0")
-    if "notify_errors" in payload:
-        set_setting("notify_errors", "1" if bool(payload["notify_errors"]) else "0")
     if "qb_ignored_tags" in payload:
         set_setting("qb_ignored_tags", str(payload.get("qb_ignored_tags") or ""))
     if "ai_enabled" in payload:
@@ -3892,7 +3754,7 @@ def update_profile(payload: dict[str, Any]) -> dict[str, Any]:
             INSERT INTO forcedfr_profiles(name,media_type,forced_required,missing_action,error_action,enabled,updated_at,error_retries,error_retry_delay,found_action,torrent_missing_action,ai_necessary_action,ai_not_necessary_action,ai_indeterminate_action)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(name) DO UPDATE SET media_type=excluded.media_type,forced_required=excluded.forced_required,missing_action=excluded.missing_action,error_action=excluded.error_action,enabled=excluded.enabled,updated_at=excluded.updated_at,error_retries=excluded.error_retries,error_retry_delay=excluded.error_retry_delay,found_action=excluded.found_action,torrent_missing_action=excluded.torrent_missing_action,ai_necessary_action=excluded.ai_necessary_action,ai_not_necessary_action=excluded.ai_not_necessary_action,ai_indeterminate_action=excluded.ai_indeterminate_action
-        """, (name,media_type,int(bool(payload.get("forced_required",True))),str(payload.get("missing_action") or "review"),str(payload.get("error_action") or "notify_continue"),int(bool(payload.get("enabled",True))),time.time(),max(1,min(20,int(payload.get("error_retries") or 5))),max(1.0,min(3600.0,float(payload.get("error_retry_delay") or 30))),str(payload.get("found_action") or "validate"),str(payload.get("torrent_missing_action") or "pause_notify"),str(payload.get("ai_necessary_action") or "pause_notify"),str(payload.get("ai_not_necessary_action") or "continue_notify"),str(payload.get("ai_indeterminate_action") or "pause_decision")))
+        """, (name,media_type,int(bool(payload.get("forced_required",True))),str(payload.get("missing_action") or "review"),str(payload.get("error_action") or "resume"),int(bool(payload.get("enabled",True))),time.time(),max(1,min(20,int(payload.get("error_retries") or 5))),max(1.0,min(3600.0,float(payload.get("error_retry_delay") or 30))),str(payload.get("found_action") or "resume"),str(payload.get("torrent_missing_action") or "scan_ai"),str(payload.get("ai_necessary_action") or "pause_decision"),str(payload.get("ai_not_necessary_action") or "resume_notify"),str(payload.get("ai_indeterminate_action") or "pause_decision")))
     return {"ok": True}
 
 
