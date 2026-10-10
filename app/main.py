@@ -3405,7 +3405,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.6.13</title>
+<title>ForcedFR v2.7.1</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -3435,8 +3435,54 @@ body[data-theme="light"]{background:radial-gradient(ellipse at 70% -10%,rgba(101
 @media(max-width:1100px){.app-shell{grid-template-columns:210px minmax(0,1fr)}.services{grid-template-columns:repeat(3,minmax(0,1fr))}.media-grid{grid-template-columns:repeat(auto-fill,minmax(155px,1fr))}}
 @media(max-width:760px){.app-shell{grid-template-columns:1fr}.sidebar{position:sticky;top:0;height:auto;padding:11px 14px;gap:10px;border-right:0;border-bottom:1px solid var(--border)}.sidebar-brand{padding:0 3px}.sidebar-brand .brand-logo{width:34px;height:34px;flex-basis:34px}.sidebar-brand h1{font-size:1rem}.sidebar-brand small,.nav-label,.sidebar-bottom{display:none}.tabs{flex-direction:row;overflow-x:auto;gap:5px;padding-bottom:2px}.tab{width:auto;flex:0 0 auto;padding:9px 11px;font-size:.75rem;white-space:nowrap}.tab .nav-icon{width:auto}.main-content{padding:23px 15px 38px!important}.app-header{align-items:flex-start;gap:10px}.app-header h1{font-size:1.45rem}.header-actions{flex-wrap:wrap;justify-content:flex-end}.theme-toggle{font-size:0;padding:9px 11px}.theme-toggle .theme-icon{font-size:1rem}.services{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}.service-card{padding:11px}.media-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.media-info{padding:10px}.settings-grid{grid-template-columns:1fr}.activity-row{grid-template-columns:1fr auto;gap:7px}.activity-date{grid-column:1/-1}.activity-main{min-width:0}.activity-details{white-space:normal}.series-detail-head{grid-template-columns:110px 1fr;gap:14px}.series-detail-poster{width:110px}.episode-card{grid-template-columns:1fr;gap:8px}.episode-actions{justify-content:flex-start}}
 @media(max-width:430px){.services{grid-template-columns:1fr 1fr}.service-icon{width:29px;height:29px;flex-basis:29px}.service-icon img{width:21px;height:21px}.service-card{gap:8px}.service-name{font-size:.74rem}.service-meta{font-size:.67rem}.version{display:none}.media-title{font-size:.8rem}.media-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.profile-grid{grid-template-columns:1fr}.config-field{grid-template-columns:1fr;gap:5px}}
+
+/* Responsive correction v2.7.1 */
+*,*::before,*::after{box-sizing:border-box}
+html,body{width:100%;max-width:100%;overflow-x:hidden}
+.app-shell{width:100%;max-width:100%;min-width:0;grid-template-columns:248px minmax(0,1fr)}
+.main-content{min-width:0;width:100%;max-width:100%;overflow-x:clip}
+.main-content>*{min-width:0;max-width:100%}
+#dashCards{grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr))}
+.services{grid-template-columns:repeat(auto-fit,minmax(min(100%,190px),1fr))}
+.activity,.activity-row,.activity-main,.activity-details,.tablewrap{min-width:0;max-width:100%}
+@media(max-width:760px){
+ .app-shell{display:flex;flex-direction:column;gap:0}
+ .sidebar{position:relative;top:auto;width:100%;height:auto;min-width:0;overflow:hidden;padding:10px 12px;gap:10px}
+ .sidebar-brand{min-width:0}
+ .tabs{width:100%;max-width:100%;overflow-x:auto;overflow-y:hidden;flex-wrap:nowrap;scrollbar-width:thin;-webkit-overflow-scrolling:touch}
+ .tab{flex:0 0 auto}
+ main.main-content{width:100%;min-width:0;max-width:100%;padding:20px 14px 34px!important;margin:0}
+ .app-header{width:100%;min-width:0;align-items:flex-start}
+ .app-header>div:first-child{min-width:0;flex:1}
+ .app-header h1{font-size:1.35rem;overflow-wrap:anywhere}
+ .app-header .sub{font-size:.82rem}
+ .header-actions{flex:0 0 auto;max-width:100%}
+ .theme-toggle{min-height:40px}
+ .services{grid-template-columns:repeat(2,minmax(0,1fr));width:100%;gap:9px}
+ .service-card{min-width:0;overflow-wrap:anywhere;padding:10px}
+ #dashCards{grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;width:100%}
+ #dashCards .card{min-width:0;padding:14px}
+ .grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .section-head{align-items:flex-start;flex-direction:column;gap:8px}
+ .activity-row{grid-template-columns:minmax(0,1fr);gap:6px;padding:13px}
+ .activity-date{white-space:normal}
+ .activity-details{white-space:normal;overflow-wrap:anywhere;line-height:1.45}
+ .media-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+ .tablewrap{overflow-x:auto}
+}
+@media(max-width:420px){
+ main.main-content{padding-left:11px!important;padding-right:11px!important}
+ .services{grid-template-columns:minmax(0,1fr)}
+ #dashCards{grid-template-columns:repeat(2,minmax(0,1fr))}
+ #dashCards .card{padding:11px}
+ .value{overflow-wrap:anywhere}
+ .media-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+ .header-actions .version{display:none}
+ .theme-toggle{padding:8px 10px}
+ .tab{padding:8px 10px;font-size:.72rem}
+}
 </style></head><body><div class="app-shell"><aside class="sidebar"><div class="sidebar-brand"><svg class="brand-logo" viewBox="0 0 64 64" aria-label="Forced FR"><defs><linearGradient id="sideffg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b7bff"/><stop offset="1" stop-color="#5c8dff"/></linearGradient></defs><rect x="4" y="4" width="56" height="56" rx="17" fill="url(#sideffg)"/><path d="M18 18h27v8H27v6h16v8H27v8h-9V18z" fill="white"/><circle cx="46" cy="47" r="6" fill="#3bd6a0" stroke="#fff" stroke-width="3"/></svg><div><h1>ForcedFR</h1><small>Media intelligence</small></div></div><div><div class="nav-label">Espace de travail</div><nav class="tabs"><button class="tab active" data-tab="dashboard"><span class="nav-icon">⌂</span>Vue d’ensemble</button><button class="tab" data-tab="scan"><span class="nav-icon">▦</span>Bibliothèque</button><button class="tab" data-tab="history"><span class="nav-icon">◷</span>Historique</button><button class="tab" data-tab="errors"><span class="nav-icon">⚠</span>Erreurs à traiter</button><button class="tab" data-tab="settings"><span class="nav-icon">⚙</span>Paramètres</button></nav></div><div class="sidebar-bottom"><strong>Surveillance active</strong><p>ForcedFR surveille les téléchargements et vérifie les pistes de sous-titres.</p></div></aside><main class="main-content">
-<header class="app-header"><div><h1>Vue d’ensemble</h1><p class="sub">Suivez votre bibliothèque et l’activité de ForcedFR.</p></div><div class="header-actions"><button class="theme-toggle" id="themeToggle" type="button" title="Changer le thème"><span class="theme-icon" id="themeIcon">☼</span><span id="themeLabel">Mode clair</span></button><div class="version">v2.6.13</div></div></header>
+<header class="app-header"><div><h1>Vue d’ensemble</h1><p class="sub">Suivez votre bibliothèque et l’activité de ForcedFR.</p></div><div class="header-actions"><button class="theme-toggle" id="themeToggle" type="button" title="Changer le thème"><span class="theme-icon" id="themeIcon">☼</span><span id="themeLabel">Mode clair</span></button><div class="version">v2.7.1</div></div></header>
 <div class="services">
 <div class="service-card"><div class="service-icon">✓</div><div><div class="service-name">ForcedFR</div><div class="service-meta"><span class="status-dot online"></span> Service actif</div></div></div>
 <div class="service-card"><div class="service-icon"><img src="https://cdn.simpleicons.org/qbittorrent" alt="qBittorrent"></div><div><div class="service-name">qBittorrent</div><div class="service-meta value" id="qb">…</div></div></div>
