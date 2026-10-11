@@ -107,9 +107,19 @@ app = FastAPI(
 )
 
 # Logos PNG fournis dans app/templates. Les fichiers restent externes au code.
-TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+# Cherche le dossier à côté de ce fichier, puis dans le dossier app/ du projet.
+_APP_DIR = Path(__file__).resolve().parent
+_PROJECT_DIR = _APP_DIR.parent
+_TEMPLATES_CANDIDATES = (
+    _APP_DIR / "templates",
+    _APP_DIR / "app" / "templates",
+    _PROJECT_DIR / "app" / "templates",
+)
+TEMPLATES_DIR = next((candidate for candidate in _TEMPLATES_CANDIDATES if candidate.is_dir()), _APP_DIR / "templates")
 if TEMPLATES_DIR.is_dir():
-    app.mount("/templates", StaticFiles(directory=str(TEMPLATES_DIR)), name="templates")
+    app.mount("/templates", StaticFiles(directory=str(TEMPLATES_DIR), check_dir=True), name="templates")
+else:
+    log.warning("Dossier des logos introuvable. Dossiers vérifiés : %s", ", ".join(str(p) for p in _TEMPLATES_CANDIDATES))
 
 
 # ============================================================
@@ -3410,7 +3420,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.8.8</title>
+<title>ForcedFR v2.8.9</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -3579,7 +3589,7 @@ body[data-theme="dark"] .settings-card .profile-field input{background:#080d15;c
 }
 
 
-/* ForcedFR 2.8.8 — barre d'état compacte */
+/* ForcedFR 2.8.9 — barre d'état compacte */
 .service-status-row{display:grid!important;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px;margin:20px 0 28px;padding:0 0 26px;border-bottom:1px solid var(--border)}
 .service-status-row .service-card{display:flex;align-items:center;gap:10px;min-width:0;min-height:76px;padding:12px 14px;border:1px solid var(--border);border-radius:18px;background:var(--surface);box-shadow:0 4px 14px rgba(0,0,0,.05)}
 .service-status-row .service-icon{width:44px;height:44px;flex:0 0 44px;display:flex;align-items:center;justify-content:center;background:transparent!important;border:0!important;border-radius:0!important;overflow:visible}
@@ -3623,7 +3633,7 @@ body[data-theme="dark"] .service-status-row .service-card{background:#111a28;bor
 .service-status-row .service-status-dot.offline{background:#ff4d5e!important;box-shadow:0 0 8px rgba(255,77,94,.85)!important}
 
 </style></head><body><button class="mobile-nav-toggle" id="mobileNavToggle" aria-label="Afficher la navigation" aria-expanded="false">☰ <span>Menu</span></button><div class="nav-backdrop" id="navBackdrop"></div><div class="app-shell"><aside class="sidebar"><div class="sidebar-brand"><img class="brand-logo" src="/templates/IMG_7497.png" alt="Logo ForcedFR"><div><h1>ForcedFR</h1><small>Media intelligence</small></div></div><div><div class="nav-label">Espace de travail</div><nav class="tabs"><button class="tab active" data-tab="dashboard"><span class="nav-icon">⌂</span>Vue d’ensemble</button><button class="tab" data-tab="scan"><span class="nav-icon">▦</span>Bibliothèque</button><button class="tab" data-tab="history"><span class="nav-icon">◷</span>Historique</button><button class="tab" data-tab="pending"><span class="nav-icon">⚠</span>Fichiers à traiter</button><button class="tab" data-tab="settings"><span class="nav-icon">⚙</span>Paramètres</button></nav></div><div class="sidebar-bottom"><strong>Surveillance active</strong><p>ForcedFR surveille les téléchargements et vérifie les pistes de sous-titres.</p></div></aside><main class="main-content">
-<header class="app-header"><div><h1>Vue d’ensemble</h1><p class="sub">Suivez votre bibliothèque et l’activité de ForcedFR.</p></div><div class="header-actions"><button class="theme-toggle" id="themeToggle" type="button" title="Changer le thème"><span class="theme-icon" id="themeIcon">☼</span><span id="themeLabel">Mode clair</span></button><div class="version">v2.8.8</div></div></header>
+<header class="app-header"><div><h1>Vue d’ensemble</h1><p class="sub">Suivez votre bibliothèque et l’activité de ForcedFR.</p></div><div class="header-actions"><button class="theme-toggle" id="themeToggle" type="button" title="Changer le thème"><span class="theme-icon" id="themeIcon">☼</span><span id="themeLabel">Mode clair</span></button><div class="version">v2.8.9</div></div></header>
 <div class="services service-status-row">
 <div class="service-card" id="service-forcedfr"><div class="service-icon"><img src="/templates/IMG_7497.png" alt="ForcedFR"></div><div class="service-name">ForcedFR</div><span class="service-status-dot online" aria-label="État de ForcedFR"></span></div>
 <div class="service-card" id="service-qbittorrent"><div class="service-icon"><img src="/templates/IMG_7496.png" alt="qBittorrent"></div><div class="service-name">qBittorrent</div><span class="service-status-dot online" aria-label="État de qBittorrent"></span><span class="service-meta value" id="qb" aria-hidden="true"></span></div>
