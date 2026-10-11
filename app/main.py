@@ -106,13 +106,14 @@ app = FastAPI(
     version="2.8.9",
 )
 
-# Logos PNG servis depuis app/static (noms sensibles à la casse).
+# Logos PNG externes, servis depuis app/static.
+# Quand ce fichier est app/main.py, le dossier attendu est app/static.
 _APP_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _APP_DIR.parent
 _STATIC_CANDIDATES = (
     _APP_DIR / "static",
-    _APP_DIR / "app" / "static",
     _PROJECT_DIR / "app" / "static",
+    _PROJECT_DIR / "static",
 )
 STATIC_DIR = next((candidate for candidate in _STATIC_CANDIDATES if candidate.is_dir()), None)
 if STATIC_DIR is not None:
@@ -120,7 +121,6 @@ if STATIC_DIR is not None:
     log.info("Fichiers statiques servis depuis : %s", STATIC_DIR)
 else:
     log.warning("Dossier static introuvable. Dossiers vérifiés : %s", ", ".join(str(p) for p in _STATIC_CANDIDATES))
-
 
 
 # ============================================================
@@ -2195,7 +2195,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.8.9",
+        "version": "2.8.6",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -3865,7 +3865,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.8.9",
+        "version": "2.8.6",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
