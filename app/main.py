@@ -103,23 +103,24 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.6.13",
+    version="2.8.9",
 )
 
-# Logos PNG fournis dans app/templates. Les fichiers restent externes au code.
-# Cherche le dossier à côté de ce fichier, puis dans le dossier app/ du projet.
+# Logos PNG servis depuis app/static (noms sensibles à la casse).
 _APP_DIR = Path(__file__).resolve().parent
 _PROJECT_DIR = _APP_DIR.parent
-_TEMPLATES_CANDIDATES = (
-    _APP_DIR / "templates",
-    _APP_DIR / "app" / "templates",
-    _PROJECT_DIR / "app" / "templates",
+_STATIC_CANDIDATES = (
+    _APP_DIR / "static",
+    _APP_DIR / "app" / "static",
+    _PROJECT_DIR / "app" / "static",
 )
-TEMPLATES_DIR = next((candidate for candidate in _TEMPLATES_CANDIDATES if candidate.is_dir()), _APP_DIR / "templates")
-if TEMPLATES_DIR.is_dir():
-    app.mount("/templates", StaticFiles(directory=str(TEMPLATES_DIR), check_dir=True), name="templates")
+STATIC_DIR = next((candidate for candidate in _STATIC_CANDIDATES if candidate.is_dir()), None)
+if STATIC_DIR is not None:
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR), check_dir=True), name="static")
+    log.info("Fichiers statiques servis depuis : %s", STATIC_DIR)
 else:
-    log.warning("Dossier des logos introuvable. Dossiers vérifiés : %s", ", ".join(str(p) for p in _TEMPLATES_CANDIDATES))
+    log.warning("Dossier static introuvable. Dossiers vérifiés : %s", ", ".join(str(p) for p in _STATIC_CANDIDATES))
+
 
 
 # ============================================================
@@ -2194,7 +2195,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.8.6",
+        "version": "2.8.9",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -3632,14 +3633,14 @@ body[data-theme="dark"] .service-status-row .service-card{background:#111a28;bor
 .service-status-row .service-status-dot.warning{background:#ffad33!important;box-shadow:0 0 8px rgba(255,173,51,.85)!important}
 .service-status-row .service-status-dot.offline{background:#ff4d5e!important;box-shadow:0 0 8px rgba(255,77,94,.85)!important}
 
-</style></head><body><button class="mobile-nav-toggle" id="mobileNavToggle" aria-label="Afficher la navigation" aria-expanded="false">☰ <span>Menu</span></button><div class="nav-backdrop" id="navBackdrop"></div><div class="app-shell"><aside class="sidebar"><div class="sidebar-brand"><img class="brand-logo" src="/templates/IMG_7497.png" alt="Logo ForcedFR"><div><h1>ForcedFR</h1><small>Media intelligence</small></div></div><div><div class="nav-label">Espace de travail</div><nav class="tabs"><button class="tab active" data-tab="dashboard"><span class="nav-icon">⌂</span>Vue d’ensemble</button><button class="tab" data-tab="scan"><span class="nav-icon">▦</span>Bibliothèque</button><button class="tab" data-tab="history"><span class="nav-icon">◷</span>Historique</button><button class="tab" data-tab="pending"><span class="nav-icon">⚠</span>Fichiers à traiter</button><button class="tab" data-tab="settings"><span class="nav-icon">⚙</span>Paramètres</button></nav></div><div class="sidebar-bottom"><strong>Surveillance active</strong><p>ForcedFR surveille les téléchargements et vérifie les pistes de sous-titres.</p></div></aside><main class="main-content">
+</style></head><body><button class="mobile-nav-toggle" id="mobileNavToggle" aria-label="Afficher la navigation" aria-expanded="false">☰ <span>Menu</span></button><div class="nav-backdrop" id="navBackdrop"></div><div class="app-shell"><aside class="sidebar"><div class="sidebar-brand"><img class="brand-logo" src="/static/Forcedfr.PNG" alt="Logo ForcedFR"><div><h1>ForcedFR</h1><small>Media intelligence</small></div></div><div><div class="nav-label">Espace de travail</div><nav class="tabs"><button class="tab active" data-tab="dashboard"><span class="nav-icon">⌂</span>Vue d’ensemble</button><button class="tab" data-tab="scan"><span class="nav-icon">▦</span>Bibliothèque</button><button class="tab" data-tab="history"><span class="nav-icon">◷</span>Historique</button><button class="tab" data-tab="pending"><span class="nav-icon">⚠</span>Fichiers à traiter</button><button class="tab" data-tab="settings"><span class="nav-icon">⚙</span>Paramètres</button></nav></div><div class="sidebar-bottom"><strong>Surveillance active</strong><p>ForcedFR surveille les téléchargements et vérifie les pistes de sous-titres.</p></div></aside><main class="main-content">
 <header class="app-header"><div><h1>Vue d’ensemble</h1><p class="sub">Suivez votre bibliothèque et l’activité de ForcedFR.</p></div><div class="header-actions"><button class="theme-toggle" id="themeToggle" type="button" title="Changer le thème"><span class="theme-icon" id="themeIcon">☼</span><span id="themeLabel">Mode clair</span></button><div class="version">v2.8.9</div></div></header>
 <div class="services service-status-row">
-<div class="service-card" id="service-forcedfr"><div class="service-icon"><img src="/templates/IMG_7497.png" alt="ForcedFR"></div><div class="service-name">ForcedFR</div><span class="service-status-dot online" aria-label="État de ForcedFR"></span></div>
-<div class="service-card" id="service-qbittorrent"><div class="service-icon"><img src="/templates/IMG_7496.png" alt="qBittorrent"></div><div class="service-name">qBittorrent</div><span class="service-status-dot online" aria-label="État de qBittorrent"></span><span class="service-meta value" id="qb" aria-hidden="true"></span></div>
-<div class="service-card" id="service-discord"><div class="service-icon"><img src="/templates/BF909BE7-6514-4443-B8CF-C9B7B6D0E32A.png" alt="Discord"></div><div class="service-name">Discord</div><span class="service-status-dot online" aria-label="État de Discord"></span><span class="service-meta value" id="discord" aria-hidden="true"></span></div>
-<div class="service-card" id="service-radarr"><div class="service-icon"><img src="/templates/IMG_7494.png" alt="Radarr"></div><div class="service-name">Radarr</div><span class="service-status-dot online" aria-label="État de Radarr"></span><span class="service-meta value" id="radarr" aria-hidden="true"></span></div>
-<div class="service-card" id="service-sonarr"><div class="service-icon"><img src="/templates/IMG_7495.png" alt="Sonarr"></div><div class="service-name">Sonarr</div><span class="service-status-dot online" aria-label="État de Sonarr"></span><span class="service-meta value" id="sonarr" aria-hidden="true"></span></div>
+<div class="service-card" id="service-forcedfr"><div class="service-icon"><img src="/static/Forcedfr.PNG" alt="ForcedFR"></div><div class="service-name">ForcedFR</div><span class="service-status-dot online" aria-label="État de ForcedFR"></span></div>
+<div class="service-card" id="service-qbittorrent"><div class="service-icon"><img src="/static/Qbittorrent.PNG" alt="qBittorrent"></div><div class="service-name">qBittorrent</div><span class="service-status-dot online" aria-label="État de qBittorrent"></span><span class="service-meta value" id="qb" aria-hidden="true"></span></div>
+<div class="service-card" id="service-discord"><div class="service-icon"><img src="/static/Discord.PNG" alt="Discord"></div><div class="service-name">Discord</div><span class="service-status-dot online" aria-label="État de Discord"></span><span class="service-meta value" id="discord" aria-hidden="true"></span></div>
+<div class="service-card" id="service-radarr"><div class="service-icon"><img src="/static/Radarr.PNG" alt="Radarr"></div><div class="service-name">Radarr</div><span class="service-status-dot online" aria-label="État de Radarr"></span><span class="service-meta value" id="radarr" aria-hidden="true"></span></div>
+<div class="service-card" id="service-sonarr"><div class="service-icon"><img src="/static/Sonarr.PNG" alt="Sonarr"></div><div class="service-name">Sonarr</div><span class="service-status-dot online" aria-label="État de Sonarr"></span><span class="service-meta value" id="sonarr" aria-hidden="true"></span></div>
 </div>
 
 <div class="grid" id="dashCards"></div>
@@ -3864,7 +3865,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.8.6",
+        "version": "2.8.9",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
