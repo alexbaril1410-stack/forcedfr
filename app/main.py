@@ -3575,9 +3575,7 @@ body[data-theme="dark"] .settings-card .profile-field input{background:#080d15;c
 .service-card .service-name{font-size:.9rem;font-weight:850}
 .service-card .service-meta{display:none!important}
 .service-card .service-name{display:flex;align-items:center;gap:9px}
-.service-card .service-name::before{content:"";display:inline-block;width:11px;height:11px;flex:0 0 11px;border-radius:50%;background:var(--green)}
-.service-card.service-offline .service-name::before{background:var(--red)}
-.service-card.service-warning .service-name::before{background:var(--yellow)}
+/* Indicateurs ::before supprimés : conserver uniquement les pastilles de statut à droite. */
 @media(max-width:760px){
  .profile-card .profile-grid{grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
  .profile-card .profile-field span{min-height:5.2em;font-size:.9rem}
