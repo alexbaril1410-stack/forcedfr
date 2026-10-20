@@ -140,6 +140,17 @@ processing_torrents: set[str] = set()
 MAIN_EVENT_LOOP: asyncio.AbstractEventLoop | None = None
 discord_bot: Any = None
 
+# Une panne qBittorrent continue est signalée une fois après une minute.
+# Si Discord est temporairement indisponible, l'envoi est retenté sans spammer.
+QBITTORRENT_ALERT_AFTER_SECONDS = 60
+QBITTORRENT_ALERT_RETRY_SECONDS = 300
+QBITTORRENT_WARNING_LOG_SECONDS = 60
+qb_outage_started_at: float | None = None
+qb_outage_last_error = ""
+qb_outage_alert_sent = False
+qb_outage_last_alert_attempt = 0.0
+qb_outage_last_warning = 0.0
+
 # Évite qu'une même notification Discord soit traitée plusieurs fois.
 resolved_discord_actions: set[str] = set()
 discord_lifecycle_task: asyncio.Task | None = None
@@ -1917,6 +1928,98 @@ def process_new_torrent(
 # SURVEILLANCE qBITTORRENT
 # ============================================================
 
+async def _send_qbittorrent_health_alert(title: str, description: str, *, color: int) -> bool:
+    """Send an operational alert through the configured Discord bot or webhook."""
+    if discord_bot is not None and discord_bot.is_ready() and DISCORD_CHANNEL_ID:
+        try:
+            channel = discord_bot.get_channel(int(DISCORD_CHANNEL_ID))
+            if channel is None:
+                channel = await discord_bot.fetch_channel(int(DISCORD_CHANNEL_ID))
+            await channel.send(embed=discord.Embed(title=title, description=description, color=color))
+            return True
+        except Exception as exc:
+            log.warning("Envoi de l’alerte qBittorrent via le bot Discord impossible : %s", exc)
+
+    if DISCORD_WEBHOOK_URL:
+        try:
+            payload = {"embeds": [{"title": title, "description": description, "color": color}]}
+            response = await asyncio.to_thread(requests.post, DISCORD_WEBHOOK_URL, json=payload, timeout=15)
+            response.raise_for_status()
+            return True
+        except Exception as exc:
+            log.warning("Envoi de l’alerte qBittorrent via le webhook Discord impossible : %s", exc)
+
+    log.warning("Aucun canal Discord disponible pour signaler l’état de qBittorrent.")
+    return False
+
+
+async def _handle_qbittorrent_failure(error: Exception) -> None:
+    global qb_outage_started_at, qb_outage_last_error
+    global qb_outage_alert_sent, qb_outage_last_alert_attempt, qb_outage_last_warning
+
+    now = time.time()
+    if qb_outage_started_at is None:
+        qb_outage_started_at = now
+        qb_outage_last_error = str(error)
+        qb_outage_last_warning = 0.0
+        log.warning("Connexion à qBittorrent perdue : %s", error)
+    else:
+        qb_outage_last_error = str(error)
+
+    if now - qb_outage_last_warning >= QBITTORRENT_WARNING_LOG_SECONDS:
+        elapsed = int(now - qb_outage_started_at)
+        log.warning("qBittorrent reste indisponible depuis %ss : %s", elapsed, qb_outage_last_error)
+        qb_outage_last_warning = now
+
+    elapsed = now - qb_outage_started_at
+    if elapsed < QBITTORRENT_ALERT_AFTER_SECONDS:
+        return
+    if qb_outage_alert_sent or now - qb_outage_last_alert_attempt < QBITTORRENT_ALERT_RETRY_SECONDS:
+        return
+
+    qb_outage_last_alert_attempt = now
+    minutes = max(1, int(elapsed // 60))
+    sent = await _send_qbittorrent_health_alert(
+        "🚨 qBittorrent indisponible",
+        f"ForcedFR ne peut plus joindre qBittorrent depuis environ {minutes} minute(s).\n\n"
+        f"Dernière erreur : `{qb_outage_last_error[:900]}`\n\n"
+        "Vérifie que qBittorrent est démarré, son URL, ses identifiants et son accès Web API. "
+        "ForcedFR réessaie automatiquement.",
+        color=15158332,
+    )
+    if sent:
+        qb_outage_alert_sent = True
+        log.error("Alerte Discord envoyée : qBittorrent indisponible depuis %ss.", int(elapsed))
+
+
+async def _handle_qbittorrent_recovery() -> None:
+    global qb_outage_started_at, qb_outage_last_error
+    global qb_outage_alert_sent, qb_outage_last_alert_attempt, qb_outage_last_warning
+
+    if qb_outage_started_at is None:
+        return
+
+    elapsed = int(time.time() - qb_outage_started_at)
+    if qb_outage_alert_sent:
+        minutes = max(1, int(elapsed // 60))
+        sent = await _send_qbittorrent_health_alert(
+            "✅ qBittorrent de nouveau disponible",
+            f"La connexion à qBittorrent est rétablie après environ {minutes} minute(s) d’interruption. "
+            "La surveillance ForcedFR a repris.",
+            color=5763719,
+        )
+        if not sent:
+            log.warning("qBittorrent est rétabli, mais le message de rétablissement n’a pas pu être envoyé.")
+    else:
+        log.info("qBittorrent rétabli après %ss, avant l’envoi d’une alerte.", elapsed)
+
+    qb_outage_started_at = None
+    qb_outage_last_error = ""
+    qb_outage_alert_sent = False
+    qb_outage_last_alert_attempt = 0.0
+    qb_outage_last_warning = 0.0
+
+
 async def monitor_qbittorrent() -> None:
 
     global previous_torrents
@@ -1982,13 +2085,9 @@ async def monitor_qbittorrent() -> None:
                 stable_snapshot = current_snapshot
                 stable_checks = 0
 
-        except Exception:
+        except Exception as exc:
 
-            log.warning(
-                "qBittorrent pas encore prêt. "
-                "Nouvelle tentative dans %ss.",
-                STARTUP_STABILITY_CHECK_SECONDS,
-            )
+            await _handle_qbittorrent_failure(exc)
 
             stable_snapshot = None
             stable_checks = 0
@@ -2021,6 +2120,7 @@ async def monitor_qbittorrent() -> None:
         try:
 
             torrents = get_torrents()
+            await _handle_qbittorrent_recovery()
 
             current_torrents = {
                 torrent["hash"]
@@ -2062,12 +2162,9 @@ async def monitor_qbittorrent() -> None:
                 current_torrents
             )
 
-        except Exception:
+        except Exception as exc:
 
-            log.exception(
-                "Erreur dans la surveillance "
-                "qBittorrent."
-            )
+            await _handle_qbittorrent_failure(exc)
 
         await asyncio.sleep(
             POLL_SECONDS
@@ -2199,7 +2296,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.0",
+        "version": "2.9.1",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -3577,7 +3674,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.9</title>
+<title>ForcedFR v2.9.1</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -4128,7 +4225,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.0",
+        "version": "2.9.1",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -4543,3 +4640,4 @@ def scan_series(mode: str = "incremental") -> dict[str, Any]:
 @app.post("/scan/all")
 def scan_all(mode: str = "incremental") -> dict[str, Any]:
     return start_library_scan("all", mode)
+
