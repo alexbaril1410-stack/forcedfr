@@ -13,7 +13,6 @@ from typing import Any
 import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 
 # Désactive uniquement les logs d'accès HTTP Uvicorn répétitifs.
 # Les logs applicatifs ForcedFR restent inchangés.
@@ -103,24 +102,8 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.6.13",
+    version="2.9.3",
 )
-
-# Logos PNG fournis dans app/templates. Les fichiers restent externes au code.
-# Cherche le dossier à côté de ce fichier, puis dans le dossier app/ du projet.
-_APP_DIR = Path(__file__).resolve().parent
-_PROJECT_DIR = _APP_DIR.parent
-_TEMPLATES_CANDIDATES = (
-    _APP_DIR / "templates",
-    _APP_DIR / "app" / "templates",
-    _PROJECT_DIR / "app" / "templates",
-)
-TEMPLATES_DIR = next((candidate for candidate in _TEMPLATES_CANDIDATES if candidate.is_dir()), _APP_DIR / "templates")
-if TEMPLATES_DIR.is_dir():
-    app.mount("/templates", StaticFiles(directory=str(TEMPLATES_DIR), check_dir=True), name="templates")
-else:
-    log.warning("Dossier des logos introuvable. Dossiers vérifiés : %s", ", ".join(str(p) for p in _TEMPLATES_CANDIDATES))
-
 
 # ============================================================
 # SESSION qBITTORRENT
@@ -720,6 +703,7 @@ def build_discord_bot() -> Any:
         return None
 
     intents = discord.Intents.none()
+    intents.guilds = True
     bot = discord.Client(intents=intents)
 
     @bot.event
@@ -2346,7 +2330,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.2",
+        "version": "2.9.3",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -3724,7 +3708,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.9.2</title>
+<title>ForcedFR v2.9.3</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -4275,7 +4259,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.2",
+        "version": "2.9.3",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -4691,5 +4675,6 @@ def scan_series(mode: str = "incremental") -> dict[str, Any]:
 @app.post("/scan/all")
 def scan_all(mode: str = "incremental") -> dict[str, Any]:
     return start_library_scan("all", mode)
+
 
 
