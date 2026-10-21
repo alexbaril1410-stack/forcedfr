@@ -127,6 +127,9 @@ else:
 # ============================================================
 
 qb_session = requests.Session()
+QB_AUTH_RETRY_COOLDOWN_SECONDS = 3600
+qb_auth_retry_lock = threading.Lock()
+qb_auth_last_attempt = 0.0
 
 
 # ============================================================
@@ -171,7 +174,7 @@ def qb_login() -> None:
     )
 
     if response.status_code == 403:
-        raise RuntimeError("IP bannie par qBittorrent après trop de tentatives d'authentification. Ne réessaie pas pendant le bannissement.")
+        raise RuntimeError("qBittorrent refuse la reconnexion (HTTP 403). Un bannissement d’IP est possible; vérifie aussi les identifiants et la configuration de l’API Web.")
     if response.status_code not in (200, 204):
         raise RuntimeError(f"Authentification qBittorrent échouée : HTTP {response.status_code} {response.text}")
 
@@ -185,14 +188,60 @@ def qb_login() -> None:
 # REQUÊTES qBITTORRENT
 # ============================================================
 
-def qb_request(method: str, endpoint: str, *, params: dict[str, Any] | None = None, data: dict[str, Any] | None = None) -> Any:
-    response=qb_session.request(method,f"{QB_HOST}{endpoint}",params=params,data=data,timeout=15)
-    if response.status_code==403:
-        raise RuntimeError("qBittorrent a répondu HTTP 403 : accès refusé ou IP bannie. Aucun nouvel essai d'authentification automatique n'est effectué.")
+def _qb_request_once(method: str, endpoint: str, *, params: dict[str, Any] | None, data: dict[str, Any] | None) -> requests.Response:
+    return qb_session.request(method, f"{QB_HOST}{endpoint}", params=params, data=data, timeout=15)
+
+
+def _qb_reauthenticate_after_403() -> None:
+    global qb_auth_last_attempt
+
+    now = time.time()
+    with qb_auth_retry_lock:
+        if now - qb_auth_last_attempt < QB_AUTH_RETRY_COOLDOWN_SECONDS:
+            remaining = int(QB_AUTH_RETRY_COOLDOWN_SECONDS - (now - qb_auth_last_attempt))
+            raise RuntimeError(f"Renouvellement automatique de session suspendu pendant encore {remaining}s après un échec récent.")
+
+        # Une seule authentification est tentée par période de sécurité, afin
+        # qu'un 403 dû à un bannissement ne provoque pas une boucle de login.
+        qb_auth_last_attempt = now
+        qb_session.cookies.clear()
+        try:
+            qb_login()
+        except Exception as exc:
+            raise RuntimeError(f"Reconnexion qBittorrent refusée : {exc}") from exc
+
+
+def _reset_qb_auth_retry_cooldown() -> None:
+    global qb_auth_last_attempt
+    with qb_auth_retry_lock:
+        qb_auth_last_attempt = 0.0
+
+
+def _qb_response_data(response: requests.Response) -> Any:
     response.raise_for_status()
-    if not response.text: return None
-    if "application/json" in response.headers.get("content-type",""): return response.json()
+    if not response.text:
+        return None
+    if "application/json" in response.headers.get("content-type", ""):
+        return response.json()
     return response.text
+
+
+def qb_request(method: str, endpoint: str, *, params: dict[str, Any] | None = None, data: dict[str, Any] | None = None) -> Any:
+    global qb_auth_last_attempt
+    response = _qb_request_once(method, endpoint, params=params, data=data)
+    if response.status_code == 403 and endpoint != "/api/v2/auth/login":
+        try:
+            _qb_reauthenticate_after_403()
+        except Exception as exc:
+            raise RuntimeError(f"qBittorrent a répondu HTTP 403; la session a expiré ou l’accès est refusé. {exc}") from exc
+
+        response = _qb_request_once(method, endpoint, params=params, data=data)
+        if response.status_code == 403:
+            raise RuntimeError("qBittorrent répond encore HTTP 403 après une reconnexion contrôlée. Aucun nouvel essai automatique avant une heure; vérifie les identifiants, l’accès Web API et un éventuel bannissement d’IP.")
+        with qb_auth_retry_lock:
+            qb_auth_last_attempt = 0.0
+
+    return _qb_response_data(response)
 
 # ============================================================
 # INFORMATIONS TORRENTS
@@ -2242,6 +2291,7 @@ async def startup() -> None:
         try:
 
             qb_login()
+            _reset_qb_auth_retry_cooldown()
 
         except Exception:
 
@@ -2296,7 +2346,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.1",
+        "version": "2.9.2",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -3674,7 +3724,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.9.1</title>
+<title>ForcedFR v2.9.2</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -4225,7 +4275,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.1",
+        "version": "2.9.2",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -4287,6 +4337,7 @@ def test_qbittorrent() -> dict[str, Any]:
     try:
         load_runtime_configuration()
         qb_login()
+        _reset_qb_auth_retry_cooldown()
         torrents = get_torrents()
         return {"ok": True, "message": f"qBittorrent connecté — {len(torrents)} torrent(s)."}
     except Exception as exc:
@@ -4640,4 +4691,5 @@ def scan_series(mode: str = "incremental") -> dict[str, Any]:
 @app.post("/scan/all")
 def scan_all(mode: str = "incremental") -> dict[str, Any]:
     return start_library_scan("all", mode)
+
 
