@@ -50,6 +50,7 @@ SONARR_API_KEY = os.getenv("SONARR_API_KEY", "").strip()
 # Vérification très fréquente des nouveaux torrents
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "1"))
 ANALYSIS_POLL_SECONDS = 0.5
+MIN_SUBTITLE_METADATA_PROGRESS = 0.10
 
 # Temps maximum consacré à la recherche d'un MKV analysable
 ANALYSIS_TIMEOUT = int(
@@ -102,7 +103,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.9.3",
+    version="2.9.4",
 )
 
 # ============================================================
@@ -1118,7 +1119,7 @@ def run_ffprobe(
         (
             "stream=index,codec_type:"
             "stream_disposition:"
-            "stream_tags=language,title"
+            "stream_tags=language,language_ietf,title,handler_name"
         ),
         "-of",
         "json",
@@ -1200,27 +1201,20 @@ def detect_french_forced(
             "disposition"
         ) or {}
 
-        language = str(
-            tags.get(
-                "language",
-                "",
-            )
-        ).lower()
+        language = str(tags.get("language") or "").strip().lower()
+        language_ietf = str(tags.get("language_ietf") or "").strip().lower()
+        title = str(tags.get("title") or "")
+        handler_name = str(tags.get("handler_name") or "")
+        title_lower = f"{title} {handler_name}".lower()
 
-        title = str(
-            tags.get(
-                "title",
-                "",
-            )
-        )
-
-        title_lower = title.lower()
-
-        french = language in {
-            "fr",
-            "fra",
-            "fre",
-        }
+        language_values = {language, language_ietf}
+        french_codes = {"fr", "fra", "fre", "french", "français", "francais"}
+        french = any(
+            value in french_codes
+            or value.split("-", 1)[0].split("_", 1)[0] == "fr"
+            for value in language_values
+            if value
+        ) or bool(re.search(r"(?<![a-z0-9])(?:français|francais|french)(?![a-z0-9])", title_lower))
 
         forced_flag = (
             int(
@@ -1234,11 +1228,7 @@ def detect_french_forced(
 
         forced_title = any(
             marker in title_lower
-            for marker in (
-                "forced",
-                "force",
-                "forcé",
-            )
+            for marker in ("forced", "force", "forcé")
         )
 
         subtitle = {
@@ -1246,7 +1236,9 @@ def detect_french_forced(
                 "index"
             ),
             "language": language or None,
+            "language_ietf": language_ietf or None,
             "title": title or None,
+            "handler_name": handler_name or None,
             "french": french,
             "forced_flag": forced_flag,
             "forced_title": forced_title,
@@ -1325,6 +1317,14 @@ def analyze_torrent(
         detection = detect_french_forced(
             probe
         )
+
+        file_progress = float(mkv.get("progress") or 0.0)
+        if not detection["subtitles"] and file_progress < MIN_SUBTITLE_METADATA_PROGRESS:
+            raise IncompleteMKVError(
+                "ffprobe ne voit encore aucune piste de sous-titres "
+                f"({file_progress:.1%} du fichier téléchargé, seuil de vérification "
+                f"{MIN_SUBTITLE_METADATA_PROGRESS:.0%}). Nouvelle vérification."
+            )
 
         results.append(
             {
@@ -1807,6 +1807,20 @@ def process_new_torrent(
                     "FR Forced détectée.",
                     torrent_hash,
                 )
+
+                subtitle_tracks = [
+                    subtitle
+                    for media_file in result.get("files", [])
+                    for subtitle in media_file.get("detection", {}).get("subtitles", [])
+                ]
+                if subtitle_tracks:
+                    log.info(
+                        "[%s] Pistes sous-titres vues par ffprobe : %s",
+                        torrent_hash,
+                        json.dumps(subtitle_tracks, ensure_ascii=False),
+                    )
+                else:
+                    log.warning("[%s] ffprobe n’a retourné aucune piste sous-titre.", torrent_hash)
 
                 profile, release = _torrent_profile_for_torrent(torrent)
                 name = str(torrent.get("name", ""))
@@ -2330,7 +2344,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.3",
+        "version": "2.9.4",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -3708,7 +3722,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.9.3</title>
+<title>ForcedFR v2.9.4</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -4259,7 +4273,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.3",
+        "version": "2.9.4",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -4675,6 +4689,7 @@ def scan_series(mode: str = "incremental") -> dict[str, Any]:
 @app.post("/scan/all")
 def scan_all(mode: str = "incremental") -> dict[str, Any]:
     return start_library_scan("all", mode)
+
 
 
 
