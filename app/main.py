@@ -82,6 +82,7 @@ BRAVE_SEARCH_API_KEY = os.getenv("BRAVE_SEARCH_API_KEY", "").strip()
 BRAVE_RESULTS_COUNT = int(os.getenv("BRAVE_RESULTS_COUNT", "5"))
 AI_ENABLED = os.getenv("AI_ENABLED", "1") == "1"
 AI_RETRIES = int(os.getenv("AI_RETRIES", "4"))
+GROQ_REQUEST_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -103,7 +104,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.9.5",
+    version="2.9.7",
 )
 
 # ============================================================
@@ -1561,32 +1562,107 @@ def _brave_search(title: str, media_type: str) -> list[dict[str, str]]:
     if not results: raise RuntimeError("Brave n'a retourné aucun résultat pertinent.")
     return results
 
+def _groq_error_detail(response: requests.Response) -> str:
+    try:
+        payload = response.json()
+        error = payload.get("error", payload) if isinstance(payload, dict) else payload
+        if isinstance(error, dict):
+            detail = error.get("message") or error.get("error") or json.dumps(error, ensure_ascii=False)
+        else:
+            detail = str(error)
+    except Exception:
+        detail = response.text or "Aucun détail fourni."
+    return str(detail)[:1200]
+
+
+def _groq_retry_delay(response: requests.Response, attempt: int) -> int:
+    retry_after = response.headers.get("Retry-After")
+    if retry_after:
+        try:
+            return max(1, min(300, int(float(retry_after) + 0.999)))
+        except (TypeError, ValueError):
+            pass
+    detail = _groq_error_detail(response)
+    match = re.search(r"try again in\s+(\d+(?:\.\d+)?)\s*(ms|milliseconds?|s|seconds?)\b", detail, re.I)
+    if match:
+        delay = float(match.group(1))
+        if match.group(2).lower().startswith("m"):
+            delay /= 1000
+        return max(1, min(300, int(delay + 0.999)))
+    return min(30, 2 ** (attempt - 1))
+
+
 def _groq_generate(media_type: str, title: str, search_results: list[dict[str,str]], ffprobe_summary: dict[str,Any] | None = None) -> dict[str,Any]:
     key=GROQ_API_KEY or _setting("config_GROQ_API_KEY", "")
     model=GROQ_MODEL or _setting("config_GROQ_MODEL", "openai/gpt-oss-120b")
     if not key: raise RuntimeError("Clé Groq non configurée.")
-    sources_text="\n\n".join(f"SOURCE {i+1}\nTitre: {x['title']}\nURL: {x['url']}\nRésumé: {x['description']}" for i,x in enumerate(search_results))
-    probe=json.dumps(ffprobe_summary or {}, ensure_ascii=False)[:5000]
-    prompt=f"""Analyse si l'œuvre « {title} » ({media_type}) nécessite normalement des sous-titres français Forced. Appuie-toi en priorité sur les éditions physiques françaises (Blu-ray/DVD), Blu-ray.com, DVDCompare et autres bases spécialisées home-cinéma. Les sites de streaming ne doivent pas être considérés comme preuve principale. Recherche la langue des dialogues, les passages en langue étrangère, les sous-titres français de ces passages, les informations d’édition et les différences éventuelles entre versions. Ne confonds pas une absence de piste Forced sur une release avec une absence de besoin de Forced. En cas d’informations contradictoires ou d’édition impossible à identifier, réponds INDETERMINÉ.\n\nInformations FFprobe:\n{probe}\n\nRésultats Brave:\n{sources_text}\n\nRetourne une décision parmi NÉCESSAIRE, NON NÉCESSAIRE ou INDETERMINÉ avec une confiance de 0 à 1 et une justification courte."""
-    schema={"type":"object","properties":{"recommendation":{"type":"string","enum":["NÉCESSAIRE","NON NÉCESSAIRE","INDETERMINÉ"]},"confidence":{"type":"number","minimum":0,"maximum":1},"justification":{"type":"string"},"sources":{"type":"array","items":{"type":"object","properties":{"title":{"type":"string"},"url":{"type":"string"}},"required":["title","url"],"additionalProperties":False}}},"required":["recommendation","confidence","justification","sources"],"additionalProperties":False}
+    sources_text="\n\n".join(f"SOURCE {i+1}\nTitre: {x['title']}\nURL: {x['url']}\nRésumé: {str(x['description'])[:500]}" for i,x in enumerate(search_results))
+    probe=json.dumps(ffprobe_summary or {}, ensure_ascii=False)[:2500]
+    prompt=f"""Décide si « {title} » ({media_type}) nécessite normalement des sous-titres français Forced. Privilégie les éditions physiques françaises et les bases Blu-ray/DVD; les plateformes de streaming ne sont pas une preuve suffisante. Distingue le besoin de sous-titres Forced de leur présence dans cette release. Si les sources sont contradictoires ou l'édition incertaine, choisis INDETERMINÉ.
+
+FFprobe:
+{probe}
+
+Sources:
+{sources_text}
+
+Réponds uniquement par un objet JSON contenant exactement ces champs : recommendation (NÉCESSAIRE, NON NÉCESSAIRE ou INDETERMINÉ), confidence (nombre de 0 à 1), justification (une phrase courte)."""
+    schema={"type":"object","properties":{"recommendation":{"type":"string","enum":["NÉCESSAIRE","NON NÉCESSAIRE","INDETERMINÉ"]},"confidence":{"type":"number"},"justification":{"type":"string"}},"required":["recommendation","confidence","justification"],"additionalProperties":False}
     payload={"model":model,"messages":[{"role":"system","content":"Tu es un analyste expert des sous-titres Forced. Réponds uniquement avec le JSON demandé."},{"role":"user","content":prompt}],"temperature":0,"response_format":{"type":"json_schema","json_schema":{"name":"forcedfr_decision","strict":True,"schema":schema}},"max_tokens":700}
-    last=None
-    for attempt in range(1,max(1,AI_RETRIES)+1):
-        try:
-            r=requests.post("https://api.groq.com/openai/v1/chat/completions",headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json=payload,timeout=60)
-            if r.status_code in (429,500,502,503,504):
-                last=RuntimeError(f"Groq HTTP {r.status_code}")
-                if attempt < AI_RETRIES:
-                    delay=min(30,2**(attempt-1)); log.warning("Groq temporairement indisponible (%s), nouvelle tentative dans %ss (%s/%s).",r.status_code,delay,attempt,AI_RETRIES); time.sleep(delay); continue
-            r.raise_for_status(); content=r.json()["choices"][0]["message"]["content"]
-            data=json.loads(content)
+    attempts=max(1,AI_RETRIES)
+    last: Exception | None = None
+
+    # Les traitements de torrents tournent dans des threads séparés. Le verrou
+    # évite que plusieurs analyses dépassent ensemble le quota Groq de l'instance.
+    with GROQ_REQUEST_LOCK:
+        for attempt in range(1, attempts + 1):
+            try:
+                response=requests.post("https://api.groq.com/openai/v1/chat/completions",headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},json=payload,timeout=60)
+            except requests.RequestException as exc:
+                last=exc
+                if attempt < attempts:
+                    delay=min(30,2**(attempt-1))
+                    log.warning("Erreur réseau Groq (%s), nouvelle tentative dans %ss (%s/%s).",exc,delay,attempt,attempts)
+                    time.sleep(delay)
+                    continue
+                break
+
+            if response.status_code == 429 or response.status_code in {408,500,502,503,504}:
+                last=RuntimeError(f"HTTP {response.status_code}: {_groq_error_detail(response)}")
+                if attempt < attempts:
+                    delay=_groq_retry_delay(response,attempt)
+                    log.warning("Groq temporairement indisponible (HTTP %s), nouvelle tentative dans %ss (%s/%s).",response.status_code,delay,attempt,attempts)
+                    time.sleep(delay)
+                    continue
+                break
+
+            if not response.ok:
+                raise RuntimeError(f"Groq HTTP {response.status_code}: {_groq_error_detail(response)}")
+
+            try:
+                content=response.json()["choices"][0]["message"]["content"]
+                data=json.loads(content)
+            except Exception as exc:
+                raise RuntimeError(f"Réponse Groq invalide : {exc}. Extrait : {response.text[:600]}") from exc
+            if not isinstance(data, dict):
+                raise RuntimeError("Réponse Groq invalide : l'objet JSON attendu est absent.")
+            recommendation=str(data.get("recommendation") or "").strip().upper()
+            if recommendation not in {"NÉCESSAIRE", "NON NÉCESSAIRE", "INDETERMINÉ"}:
+                raise RuntimeError(f"Réponse Groq invalide : recommandation inattendue ({recommendation or 'vide'}).")
+            try:
+                confidence=float(data.get("confidence"))
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("Réponse Groq invalide : confiance absente ou non numérique.") from exc
+            if not 0 <= confidence <= 1:
+                raise RuntimeError("Réponse Groq invalide : confiance hors intervalle 0–1.")
+            justification=str(data.get("justification") or "").strip()
+            if not justification:
+                raise RuntimeError("Réponse Groq invalide : justification vide.")
+            data={"recommendation":recommendation,"confidence":confidence,"justification":justification}
             data["model"]=model
             return data
-        except Exception as exc:
-            last=exc
-            if attempt < AI_RETRIES:
-                delay=min(30,2**(attempt-1)); log.warning("Erreur Groq (%s), nouvelle tentative dans %ss (%s/%s).",exc,delay,attempt,AI_RETRIES); time.sleep(delay)
-    raise RuntimeError(f"Groq indisponible après {AI_RETRIES} tentative(s): {last}")
+
+    raise RuntimeError(f"Groq indisponible après {attempts} tentative(s): {last}")
 
 
 def research_forced_fr_with_ai(torrent: dict[str,Any], media_type: str, title: str, ffprobe_result: dict[str,Any] | None = None, ignore_cache: bool = False) -> dict[str,Any]:
@@ -2350,7 +2426,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.5",
+        "version": "2.9.7",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -3728,7 +3804,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.9.5</title>
+<title>ForcedFR v2.9.7</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -4279,7 +4355,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.5",
+        "version": "2.9.7",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -4695,8 +4771,3 @@ def scan_series(mode: str = "incremental") -> dict[str, Any]:
 @app.post("/scan/all")
 def scan_all(mode: str = "incremental") -> dict[str, Any]:
     return start_library_scan("all", mode)
-
-
-
-
-
