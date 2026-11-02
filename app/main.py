@@ -103,7 +103,7 @@ log = logging.getLogger("forcedfr")
 app = FastAPI(
     title="ForcedFR",
     description="Détection automatique des pistes françaises forcées.",
-    version="2.9.4",
+    version="2.9.5",
 )
 
 # ============================================================
@@ -2239,13 +2239,19 @@ async def _discord_lifecycle_loop() -> None:
                             except Exception: pass
                             with _db_connect() as conn: conn.execute("UPDATE discord_messages SET deleted_at=? WHERE message_id=?",(now,str(row["message_id"])))
                         elif age>=24*3600 and not int(row["reminder_sent"]):
+                            reminder_sent = False
                             try:
                                 embeds=[]
                                 for e in msg.embeds:
-                                    d=e.to_dict(); d["description"]=(d.get("description") or "")+"\n\n⏰ **Rappel : une décision est toujours nécessaire.**"; embeds.append(d)
-                                await msg.edit(embeds=embeds or None)
+                                    d=e.to_dict(); d["description"]=(d.get("description") or "")+"\n\n⏰ **Rappel : une décision est toujours nécessaire.**"; embeds.append(discord.Embed.from_dict(d))
+                                if embeds:
+                                    await msg.edit(embeds=embeds)
+                                else:
+                                    await msg.edit(content=(msg.content or "")+"\n\n⏰ Rappel : une décision est toujours nécessaire.")
+                                reminder_sent = True
                             except Exception: log.exception("Impossible de relancer le message Discord %s.",row["message_id"])
-                            with _db_connect() as conn: conn.execute("UPDATE discord_messages SET reminder_sent=1 WHERE message_id=?",(str(row["message_id"]),))
+                            if reminder_sent:
+                                with _db_connect() as conn: conn.execute("UPDATE discord_messages SET reminder_sent=1 WHERE message_id=?",(str(row["message_id"]),))
                     elif age>=24*3600:
                         try: await msg.delete()
                         except Exception: pass
@@ -2344,7 +2350,7 @@ def health() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.4",
+        "version": "2.9.5",
         "qbittorrent": QB_HOST,
         "monitoring": True,
         "poll_seconds": POLL_SECONDS,
@@ -3722,7 +3728,7 @@ def _qbittorrent_status() -> tuple[str, int | None]:
 def web_dashboard() -> str:
     return """<!doctype html>
 <html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ForcedFR v2.9.4</title>
+<title>ForcedFR v2.9.5</title>
 <style>
 :root{color-scheme:dark;--bg:#080c12;--surface:#101722;--surface2:#151e2b;--surface3:#1b2635;--border:#263345;--text:#f3f6fa;--muted:#8d9aac;--accent:#5b8cff;--accent2:#7b68ee;--green:#35c98a;--yellow:#f0b85a;--red:#ef6b73;--shadow:0 14px 40px rgba(0,0,0,.22);font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 *{box-sizing:border-box}html{background:var(--bg)}body{margin:0;background:radial-gradient(circle at 50% -10%,#1a2638 0,#080c12 42%);color:var(--text);min-height:100vh}main{max-width:1440px;margin:auto;padding:30px 28px 55px}h1,h2,h3,p{margin-top:0}h1{font-size:1.72rem;letter-spacing:-.035em;margin-bottom:3px}h2{font-size:1.12rem;letter-spacing:-.015em;margin-bottom:5px}.sub,.small{color:var(--muted)}.sub{font-size:.88rem;line-height:1.45}.small{font-size:.78rem}
@@ -4273,7 +4279,7 @@ def status() -> dict[str, Any]:
 
     return {
         "status": "ok",
-        "version": "2.9.4",
+        "version": "2.9.5",
         "uptime_seconds": int(time.time() - SERVICE_STARTED_AT),
         "qbittorrent": {
             "status": qb_status,
@@ -4689,6 +4695,7 @@ def scan_series(mode: str = "incremental") -> dict[str, Any]:
 @app.post("/scan/all")
 def scan_all(mode: str = "incremental") -> dict[str, Any]:
     return start_library_scan("all", mode)
+
 
 
 
